@@ -1,141 +1,50 @@
-use core::ops::{Deref, DerefMut, Index, IndexMut, Range, RangeFull, RangeTo};
-use core::slice;
-
-const PAGE_BITS: u32 = 12;
-pub const PAGE_SIZE: usize = 1 << PAGE_BITS;
+use core::ops::{Deref, DerefMut};
+use core::slice::{from_raw_parts, from_raw_parts_mut};
 
 pub struct Dma<T> {
-    pub virt: *mut T,
-    pub phys: usize,
-    pub size: usize,
+    count: usize,
+    pub addr: *mut T,
+    pub phys_addr: usize,
 }
 
-// should be safe
 impl<T> Deref for Dma<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { &*self.virt }
+        unsafe { &*self.addr }
     }
 }
 
 impl<T> DerefMut for Dma<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.virt }
+        unsafe { &mut *self.addr }
     }
 }
 
-// Trait for types that can be viewed as DMA slices
-pub trait DmaSlice {
-    type Item;
-
-    fn chunks(&self, bytes: usize) -> DmaChunks<u8>;
-    fn slice(&self, range: Range<usize>) -> Self::Item;
-}
-
-// mildly overengineered lol
-pub struct DmaChunks<'a, T> {
-    current_offset: usize,
-    chunk_size: usize,
-    dma: &'a Dma<T>,
-}
-
-impl<'a, T> Iterator for DmaChunks<'a, T> {
-    type Item = DmaChunk<'a, T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current_offset >= self.dma.size {
-            None
-        } else {
-            let chunk_phys_addr = self.dma.phys + self.current_offset * core::mem::size_of::<T>();
-            let offset_ptr = unsafe { self.dma.virt.add(self.current_offset) };
-            let len = core::cmp::min(
-                self.chunk_size,
-                (self.dma.size - self.current_offset) / core::mem::size_of::<T>(),
-            );
-
-            self.current_offset += len;
-
-            Some(DmaChunk {
-                phys_addr: chunk_phys_addr,
-                slice: unsafe { core::slice::from_raw_parts_mut(offset_ptr, len) },
-            })
-        }
+impl AsRef<[u8]> for Dma<u8> {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { from_raw_parts(self.addr, self.count) }
     }
 }
 
-// Represents a chunk obtained from a Dma<T>, with physical address and slice.
-pub struct DmaChunk<'a, T> {
-    pub phys_addr: usize,
-    pub slice: &'a mut [T],
+impl AsMut<[u8]> for Dma<u8> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe { from_raw_parts_mut(self.addr, self.count) }
+    }
+}
+
+pub trait DmaSlice: AsRef<[u8]> + AsMut<[u8]> {
+    fn chunks(&self, bytes: usize) -> impl Iterator<Item = (&[u8], usize)>;
 }
 
 impl DmaSlice for Dma<u8> {
-    type Item = Dma<u8>;
-    fn chunks(&self, bytes: usize) -> DmaChunks<u8> {
-        DmaChunks {
-            current_offset: 0,
-            chunk_size: bytes,
-            dma: self,
-        }
-    }
-
-    fn slice(&self, index: Range<usize>) -> Self::Item {
-        assert!(index.end <= self.size, "Index out of bounds");
-
-        unsafe {
-            Dma {
-                virt: self.virt.add(index.start),
-                phys: self.phys + index.start,
-                size: (index.end - index.start),
-            }
-        }
-    }
-}
-
-impl Index<Range<usize>> for Dma<u8> {
-    type Output = [u8];
-
-    fn index(&self, index: Range<usize>) -> &Self::Output {
-        assert!(index.end <= self.size, "Index out of bounds");
-
-        unsafe { slice::from_raw_parts(self.virt.add(index.start), index.end - index.start) }
-    }
-}
-
-impl IndexMut<Range<usize>> for Dma<u8> {
-    fn index_mut(&mut self, index: Range<usize>) -> &mut Self::Output {
-        assert!(index.end <= self.size, "Index out of bounds");
-        unsafe { slice::from_raw_parts_mut(self.virt.add(index.start), index.end - index.start) }
-    }
-}
-
-impl Index<RangeTo<usize>> for Dma<u8> {
-    type Output = [u8];
-
-    fn index(&self, index: RangeTo<usize>) -> &Self::Output {
-        &self[0..index.end]
-    }
-}
-
-impl IndexMut<RangeTo<usize>> for Dma<u8> {
-    fn index_mut(&mut self, index: RangeTo<usize>) -> &mut Self::Output {
-        &mut self[0..index.end]
-    }
-}
-
-impl Index<RangeFull> for Dma<u8> {
-    type Output = [u8];
-
-    fn index(&self, _: RangeFull) -> &Self::Output {
-        &self[0..self.size]
-    }
-}
-
-impl IndexMut<RangeFull> for Dma<u8> {
-    fn index_mut(&mut self, _: RangeFull) -> &mut Self::Output {
-        let len = self.size;
-        &mut self[0..len]
+    fn chunks(&self, bytes: usize) -> impl Iterator<Item = (&[u8], usize)> {
+        let addr = self.addr.cast_const();
+        (0..self.count).step_by(bytes).map(move |offset| {
+            let len = core::cmp::min(bytes, self.count - offset);
+            let slice = unsafe { from_raw_parts(addr.add(offset), len) };
+            (slice, self.phys_addr + offset)
+        })
     }
 }
 
@@ -144,19 +53,16 @@ pub trait Allocator {
 }
 
 impl<T> Dma<T> {
-    pub fn allocate<A: Allocator>(allocator: &A, size: usize) -> Dma<T> {
-        let size = if size % PAGE_SIZE != 0 {
-            ((size >> PAGE_BITS) + 1) << PAGE_BITS
-        } else {
-            size
+    pub fn allocate<A: Allocator>(allocator: &A, count: usize) -> Dma<T> {
+        let (phys, virt) = unsafe {
+            let size = core::mem::size_of::<T>() * count;
+            allocator.allocate(size.div_ceil(4096) * 4096)
         };
 
-        let (paddr, vaddr) = unsafe { allocator.allocate(size) };
-
-        Dma {
-            virt: vaddr as *mut T,
-            phys: paddr,
-            size,
+        Self {
+            count,
+            phys_addr: phys,
+            addr: virt as *mut T,
         }
     }
 }

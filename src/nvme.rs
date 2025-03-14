@@ -1,812 +1,603 @@
-use alloc::boxed::Box;
-use alloc::collections::btree_map::BTreeMap;
-use alloc::string::String;
-use alloc::vec::Vec;
-
-use crate::memory::{Allocator, Dma};
-use crate::NvmeStats;
-
-use super::cmd::NvmeCommand;
-use super::memory::DmaSlice;
-use super::{queues::*, NvmeNamespace};
-use core::error::Error;
 use core::hint::spin_loop;
 
-// clippy doesnt like this
-#[allow(unused, clippy::upper_case_acronyms)]
-#[derive(Copy, Clone, Debug)]
-pub enum NvmeRegs32 {
-    VS = 0x8,        // Version
-    INTMS = 0xC,     // Interrupt Mask Set
-    INTMC = 0x10,    // Interrupt Mask Clear
-    CC = 0x14,       // Controller Configuration
-    CSTS = 0x1C,     // Controller Status
-    NSSR = 0x20,     // NVM Subsystem Reset
-    AQA = 0x24,      // Admin Queue Attributes
-    CMBLOC = 0x38,   // Contoller Memory Buffer Location
-    CMBSZ = 0x3C,    // Controller Memory Buffer Size
-    BPINFO = 0x40,   // Boot Partition Info
-    BPRSEL = 0x44,   // Boot Partition Read Select
-    BPMBL = 0x48,    // Bood Partition Memory Location
-    CMBSTS = 0x58,   // Controller Memory Buffer Status
-    PMRCAP = 0xE00,  // PMem Capabilities
-    PMRCTL = 0xE04,  // PMem Region Control
-    PMRSTS = 0xE08,  // PMem Region Status
-    PMREBS = 0xE0C,  // PMem Elasticity Buffer Size
-    PMRSWTP = 0xE10, // PMem Sustained Write Throughput
-}
+use alloc::collections::btree_map::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use anyhow::{Result, anyhow};
 
-#[allow(unused, clippy::upper_case_acronyms)]
-#[derive(Copy, Clone, Debug)]
-pub enum NvmeRegs64 {
-    CAP = 0x0,      // Controller Capabilities
-    ASQ = 0x28,     // Admin Submission Queue Base Address
-    ACQ = 0x30,     // Admin Completion Queue Base Address
-    CMBMSC = 0x50,  // Controller Memory Buffer Space Control
-    PMRMSC = 0xE14, // Persistent Memory Buffer Space Control
-}
+use crate::cmd::{IdentifyType, QueueType};
+use crate::memory::DmaSlice;
+use crate::queues::{CompQueue, Completion};
+use crate::queues::{QUEUE_LENGTH, SubQueue};
 
-#[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug)]
-pub enum NvmeArrayRegs {
-    SQyTDBL,
-    CQyHDBL,
-}
+use super::cmd::Command;
+use super::memory::{Allocator, Dma};
 
-// who tf is abbreviating this stuff
-#[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
-#[allow(unused)]
-struct IdentifyNamespaceData {
-    pub nsze: u64,
-    pub ncap: u64,
-    nuse: u64,
-    nsfeat: u8,
-    pub nlbaf: u8,
-    pub flbas: u8,
-    mc: u8,
-    dpc: u8,
-    dps: u8,
-    nmic: u8,
-    rescap: u8,
-    fpi: u8,
-    dlfeat: u8,
-    nawun: u16,
-    nawupf: u16,
-    nacwu: u16,
-    nabsn: u16,
-    nabo: u16,
-    nabspf: u16,
-    noiob: u16,
-    nvmcap: u128,
-    npwg: u16,
-    npwa: u16,
-    npdg: u16,
-    npda: u16,
-    nows: u16,
-    _rsvd1: [u8; 18],
-    anagrpid: u32,
-    _rsvd2: [u8; 3],
-    nsattr: u8,
-    nvmsetid: u16,
-    endgid: u16,
-    nguid: [u8; 16],
-    eui64: u64,
-    pub lba_format_support: [u32; 16],
-    _rsvd3: [u8; 192],
-    vendor_specific: [u8; 3712],
+#[allow(dead_code)]
+pub struct Namespace {
+    pub id: u32,
+    pub block_count: u64,
+    pub block_size: u64,
 }
 
-pub struct NvmeQueuePair {
-    pub id: u16,
-    pub sub_queue: NvmeSubQueue,
-    comp_queue: NvmeCompQueue,
+#[derive(Debug, Default)]
+pub struct Stats {
+    completions: u64,
+    submissions: u64,
 }
 
-impl NvmeQueuePair {
-    /// returns amount of requests pushed into submission queue
-    pub fn submit_io(&mut self, data: &impl DmaSlice, mut lba: u64, write: bool) -> usize {
-        let mut reqs = 0;
-        // TODO: contruct PRP list?
-        for chunk in data.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512;
+#[derive(Debug)]
+pub enum Register {
+    /// Controller Capabilities
+    CAP = 0x0,
+    /// Version
+    VS = 0x8,
+    /// Interrupt Mask Set
+    INTMS = 0xC,
+    /// Interrupt Mask Clear
+    INTMC = 0x10,
+    /// Controller Configuration
+    CC = 0x14,
+    /// Controller Status
+    CSTS = 0x1C,
+    /// NVM Subsystem Reset
+    NSSR = 0x20,
+    /// Admin Queue Attributes
+    AQA = 0x24,
+    /// Admin Submission Queue Base Address
+    ASQ = 0x28,
+    /// Admin Completion Queue Base Address
+    ACQ = 0x30,
+}
 
-            let addr = chunk.phys_addr as u64;
-            let bytes = blocks * 512;
-            let ptr1 = if bytes <= 4096 {
-                0
-            } else {
-                addr + 4096 // self.page_size
-            };
+#[derive(Clone, Debug)]
+pub enum Doorbell {
+    SubTail(u16),
+    CompHead(u16),
+}
 
-            let entry = if write {
-                NvmeCommand::io_write(
-                    self.id << 11 | self.sub_queue.tail as u16,
-                    1,
-                    lba,
-                    blocks as u16 - 1,
-                    addr,
-                    ptr1,
-                )
-            } else {
-                NvmeCommand::io_read(
-                    self.id << 11 | self.sub_queue.tail as u16,
-                    1,
-                    lba,
-                    blocks as u16 - 1,
-                    addr,
-                    ptr1,
-                )
-            };
+#[derive(Debug, Clone)]
+#[repr(C, packed)]
+struct NamespaceData {
+    _ignore1: u64,
+    capacity: u64,
+    _ignore2: [u8; 10],
+    lba_size: u8,
+    _ignore3: [u8; 101],
+    lba_format_support: [u32; 16],
+}
 
-            if let Some(tail) = self.sub_queue.submit_checked(entry) {
-                unsafe {
-                    core::ptr::write_volatile(self.sub_queue.doorbell as *mut u32, tail as u32);
-                }
-            } else {
-                log::error!("queue full");
-                return reqs;
-            }
+pub struct QueuePair<'a, A> {
+    id: u16,
+    device: &'a Device<A>,
+    sub_queue: SubQueue,
+    comp_queue: CompQueue,
+}
 
-            lba += blocks;
-            reqs += 1;
-        }
-        reqs
-    }
-
-    // TODO: maybe return result
-    pub fn complete_io(&mut self, n: usize) -> Option<u16> {
-        assert!(n > 0);
-        let (tail, c_entry, _) = self.comp_queue.complete_n(n);
-        unsafe {
-            core::ptr::write_volatile(self.comp_queue.doorbell as *mut u32, tail as u32);
-        }
-        self.sub_queue.head = c_entry.sq_head as usize;
-        let status = c_entry.status >> 1;
-        if status != 0 {
-            log::error!(
-                "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
-                status,
-                status & 0xFF,
-                (status >> 8) & 0x7
-            );
-            log::error!("{:?}", c_entry);
-            return None;
-        }
-        Some(c_entry.sq_head)
-    }
-
-    pub fn quick_poll(&mut self) -> Option<()> {
-        if let Some((tail, c_entry, _)) = self.comp_queue.complete() {
-            unsafe {
-                core::ptr::write_volatile(self.comp_queue.doorbell as *mut u32, tail as u32);
-            }
+impl<A: Allocator> QueuePair<'_, A> {
+    pub fn quick_poll(&mut self) -> Result<()> {
+        if let Some((tail, c_entry)) = self.comp_queue.try_pop() {
+            self.device
+                .write_doorbell(Doorbell::CompHead(self.id), tail as u32);
             self.sub_queue.head = c_entry.sq_head as usize;
+
             let status = c_entry.status >> 1;
             if status != 0 {
-                log::error!(
-                    "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
+                anyhow::bail!(
+                    "Status: 0x{:x}, Code 0x{:x}, Type: 0x{:x}",
                     status,
                     status & 0xFF,
                     (status >> 8) & 0x7
                 );
-                log::error!("{:?}", c_entry);
             }
-            return Some(());
         }
-        None
+        Ok(())
+    }
+
+    pub fn complete_io(&mut self, n: usize) -> Result<u16> {
+        let (tail, c_entry) = self.comp_queue.pop_n(n);
+        self.device
+            .write_doorbell(Doorbell::CompHead(self.id), tail as u32);
+        self.sub_queue.head = c_entry.sq_head as usize;
+
+        let status = c_entry.status >> 1;
+        if status != 0 {
+            anyhow::bail!(
+                "Status: 0x{:x}, Code 0x{:x}, Type: 0x{:x}",
+                status,
+                status & 0xFF,
+                (status >> 8) & 0x7
+            );
+        }
+        Ok(c_entry.sq_head)
+    }
+
+    pub fn submit_io(&mut self, data: &impl DmaSlice, mut lba: u64, write: bool) -> Result<usize> {
+        let mut reqs = 0;
+
+        for (chunk, phys_addr) in data.chunks(4096) {
+            let blocks = (chunk.len() as u64).div_ceil(512);
+            let addr = phys_addr as u64;
+
+            let ptr1 = match chunk.len() {
+                p if p <= 4096 => 0,
+                _ => addr + 4096,
+            };
+
+            let entry = Command::read_write(
+                self.id << 11 | self.sub_queue.tail as u16,
+                1,
+                lba,
+                blocks as u16 - 1,
+                [addr, ptr1],
+                write,
+            );
+
+            match self.sub_queue.try_push(entry) {
+                Some(tail) => {
+                    self.device
+                        .write_doorbell(Doorbell::SubTail(self.id), tail as u32);
+                    lba += blocks;
+                    reqs += 1;
+                }
+                None => {
+                    anyhow::bail!("Queue full");
+                }
+            }
+        }
+
+        Ok(reqs)
     }
 }
 
-#[allow(unused)]
-pub struct NvmeDevice<A> {
-    addr: *mut u8,
-    len: usize,
-    // Doorbell stride
-    dstrd: u16,
-    admin_sq: NvmeSubQueue,
-    admin_cq: NvmeCompQueue,
-    io_sq: NvmeSubQueue,
-    io_cq: NvmeCompQueue,
-    buffer: Dma<u8>,           // 2MiB of buffer
-    prp_list: Dma<[u64; 512]>, // Address of PRP's, devices doesn't necessarily support 2MiB page sizes; 8 Bytes * 512 = 4096
-    pub namespaces: BTreeMap<u32, NvmeNamespace>,
-    pub stats: NvmeStats,
-    q_id: u16,
+pub struct Device<A> {
+    address: *mut u8,
+    buffer: Dma<u8>,
+    prp_list: Dma<[u64; 512]>,
+    namespaces: BTreeMap<u32, Namespace>,
+    stats: Stats,
+    queue_id: u16,
     allocator: A,
+    doorbell_stride: u16,
+    admin_sq: SubQueue,
+    admin_cq: CompQueue,
+    io_sq: SubQueue,
+    io_cq: CompQueue,
 }
 
-// TODO
-unsafe impl<A> Send for NvmeDevice<A> {}
-unsafe impl<A> Sync for NvmeDevice<A> {}
+unsafe impl<A> Send for Device<A> {}
+unsafe impl<A> Sync for Device<A> {}
 
-#[allow(unused)]
-impl<A: Allocator> NvmeDevice<A> {
-    pub fn init(addr: usize, len: usize, allocator: A) -> Result<Self, Box<dyn Error>> {
-        let mut dev = Self {
-            addr: addr as *mut u8,
-            dstrd: {
-                unsafe {
-                    ((core::ptr::read_volatile(
-                        (addr as usize + NvmeRegs64::CAP as usize) as *const u64,
-                    ) >> 32)
-                        & 0b1111) as u16
-                }
-            },
-            len,
-            admin_sq: NvmeSubQueue::new(QUEUE_LENGTH, 0, &allocator)?,
-            admin_cq: NvmeCompQueue::new(QUEUE_LENGTH, 0, &allocator)?,
-            io_sq: NvmeSubQueue::new(QUEUE_LENGTH, 0, &allocator)?,
-            io_cq: NvmeCompQueue::new(QUEUE_LENGTH, 0, &allocator)?,
+impl<A: Allocator> Device<A> {
+    pub fn init(address: usize, allocator: A) -> Result<Self> {
+        let mut device = Self {
+            address: address as _,
+            queue_id: 1,
             buffer: Dma::allocate(&allocator, 4096),
-            prp_list: Dma::allocate(&allocator, 8 * 512),
+            prp_list: Dma::allocate(&allocator, 1),
             namespaces: BTreeMap::new(),
-            stats: NvmeStats::default(),
-            q_id: 1,
+            stats: Stats::default(),
+            doorbell_stride: 0,
+            admin_sq: SubQueue::new(QUEUE_LENGTH, &allocator),
+            admin_cq: CompQueue::new(QUEUE_LENGTH, &allocator),
+            io_sq: SubQueue::new(QUEUE_LENGTH, &allocator),
+            io_cq: CompQueue::new(QUEUE_LENGTH, &allocator),
             allocator,
         };
 
-        for i in 1..512 {
-            dev.prp_list[i - 1] = (dev.buffer.phys + i * 4096) as u64;
+        let cap = device.get_reg::<u64>(Register::CAP) >> 32;
+        device.doorbell_stride = cap as u16 & 0xF;
+
+        device.init_registers();
+        device.init_io_queues()?;
+        device.queue_id += 1;
+
+        Ok(device)
+    }
+
+    fn init_io_queues(&mut self) -> Result<()> {
+        self.exec_command(Command::create_queue(
+            self.admin_sq.tail as u16,
+            self.queue_id,
+            self.io_cq.address(),
+            (QUEUE_LENGTH - 1) as u16,
+            QueueType::Completion,
+            None,
+        ))?;
+        self.exec_command(Command::create_queue(
+            self.admin_sq.tail as u16,
+            self.queue_id,
+            self.io_sq.address(),
+            (QUEUE_LENGTH - 1) as u16,
+            QueueType::Submission,
+            Some(self.queue_id),
+        ))?;
+        Ok(())
+    }
+
+    fn init_registers(&mut self) {
+        let prp_base = self.buffer.phys_addr + 4096;
+        for (index, prp) in self.prp_list.iter_mut().enumerate() {
+            *prp = (prp_base + index * 4096) as u64;
         }
 
-        log::info!("CAP: 0x{:x}", dev.get_reg64(NvmeRegs64::CAP as u64));
-        log::info!("VS: 0x{:x}", dev.get_reg32(NvmeRegs32::VS as u32));
-        log::info!("CC: 0x{:x}", dev.get_reg32(NvmeRegs32::CC as u32));
-
-        log::info!("Disabling controller");
-        // Set Enable bit to 0
-        let ctrl_config = dev.get_reg32(NvmeRegs32::CC as u32) & 0xFFFF_FFFE;
-        dev.set_reg32(NvmeRegs32::CC as u32, ctrl_config);
-
-        // Wait for not ready
-        loop {
-            let csts = dev.get_reg32(NvmeRegs32::CSTS as u32);
-            if csts & 1 == 1 {
-                spin_loop();
-            } else {
-                break;
-            }
+        self.set_reg::<u32>(Register::CC, self.get_reg::<u32>(Register::CC) & !1);
+        while self.get_reg::<u32>(Register::CSTS) & 1 == 1 {
+            spin_loop();
         }
 
         // Configure Admin Queues
-        dev.set_reg64(NvmeRegs64::ASQ as u32, dev.admin_sq.get_addr() as u64);
-        dev.set_reg64(NvmeRegs64::ACQ as u32, dev.admin_cq.get_addr() as u64);
-        dev.set_reg32(
-            NvmeRegs32::AQA as u32,
-            (QUEUE_LENGTH as u32 - 1) << 16 | (QUEUE_LENGTH as u32 - 1),
-        );
+        self.set_reg::<u64>(Register::ASQ, self.admin_sq.address() as u64);
+        self.set_reg::<u64>(Register::ACQ, self.admin_cq.address() as u64);
+        let aqa = (QUEUE_LENGTH as u32 - 1) << 16 | (QUEUE_LENGTH as u32 - 1);
+        self.set_reg::<u32>(Register::AQA, aqa);
 
-        // Configure other stuff
-        // TODO: check css values
-        let mut cc = dev.get_reg32(NvmeRegs32::CC as u32);
-        // mask out reserved stuff
-        cc &= 0xFF00_000F;
-        // Set Completion (2^4 = 16 Bytes) and Submission Entry (2^6 = 64 Bytes) sizes
-        cc |= (4 << 20) | (6 << 16);
+        let cc = self.get_reg::<u32>(Register::CC) & 0xFF00_000F;
+        self.set_reg::<u32>(Register::CC, cc | (4 << 20) | (6 << 16));
 
-        // Set Memory Page Size
-        // let mpsmax = ((dev.get_reg64(NvmeRegs64::CAP as u64) >> 52) & 0xF) as u32;
-        // cc |= (mpsmax << 7);
-        // log::info!("MPS {}", (cc >> 7) & 0xF);
-        dev.set_reg32(NvmeRegs32::CC as u32, cc);
-
-        // Enable the controller
-        log::info!("Enabling controller");
-        let ctrl_config = dev.get_reg32(NvmeRegs32::CC as u32) | 1;
-        dev.set_reg32(NvmeRegs32::CC as u32, ctrl_config);
-
-        // wait for ready
-        loop {
-            let csts = dev.get_reg32(NvmeRegs32::CSTS as u32);
-            if csts & 1 == 0 {
-                spin_loop();
-            } else {
-                break;
-            }
+        self.set_reg::<u32>(Register::CC, self.get_reg::<u32>(Register::CC) | 1);
+        while self.get_reg::<u32>(Register::CSTS) & 1 == 0 {
+            spin_loop();
         }
+    }
+}
 
-        let q_id = dev.q_id;
-        let addr = dev.io_cq.get_addr();
-        log::info!("Requesting i/o completion queue");
-        let comp = dev.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::create_io_completion_queue(c_id, q_id, addr, (QUEUE_LENGTH - 1) as u16)
-        })?;
-        let addr = dev.io_sq.get_addr();
-        log::info!("Requesting i/o submission queue");
-        let comp = dev.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::create_io_submission_queue(
-                c_id,
-                q_id,
-                addr,
-                (QUEUE_LENGTH - 1) as u16,
-                q_id,
-            )
-        })?;
-        dev.q_id += 1;
-
-        Ok(dev)
+impl<A: Allocator> Device<A> {
+    fn get_reg<T>(&self, reg: Register) -> T {
+        let address = self.address as usize + reg as usize;
+        unsafe { (address as *const T).read_volatile() }
     }
 
-    pub fn identify_controller(&mut self) -> Result<(), Box<dyn Error>> {
-        log::info!("Trying to identify controller");
-        let _entry = self.submit_and_complete_admin(NvmeCommand::identify_controller);
-
-        log::info!("Dumping identify controller");
-        let mut serial = String::new();
-        let data = &self.buffer;
-
-        for &b in &data[4..24] {
-            if b == 0 {
-                break;
-            }
-            serial.push(b as char);
-        }
-
-        let mut model = String::new();
-        for &b in &data[24..64] {
-            if b == 0 {
-                break;
-            }
-            model.push(b as char);
-        }
-
-        let mut firmware = String::new();
-        for &b in &data[64..72] {
-            if b == 0 {
-                break;
-            }
-            firmware.push(b as char);
-        }
-
-        log::info!(
-            "  - Model: {} Serial: {} Firmware: {}",
-            model.trim(),
-            serial.trim(),
-            firmware.trim()
-        );
-
-        Ok(())
+    fn set_reg<T>(&self, reg: Register, value: T) {
+        let address = self.address as usize + reg as usize;
+        unsafe { (address as *mut T).write_volatile(value) }
     }
+}
 
-    // 1 to 1 Submission/Completion Queue Mapping
-    pub fn create_io_queue_pair(&mut self, len: usize) -> Result<NvmeQueuePair, Box<dyn Error>> {
-        let q_id = self.q_id;
-        log::info!("Requesting i/o queue pair with id {q_id}");
+impl<A: Allocator> Device<A> {
+    pub fn identify_namespace(&mut self, id: u32) -> Result<Namespace> {
+        self.exec_command(Command::identify(
+            self.admin_sq.tail as u16,
+            self.buffer.phys_addr,
+            IdentifyType::Namespace(id),
+        ))?;
 
-        let offset = 0x1000 + ((4 << self.dstrd) * (2 * q_id + 1) as usize);
-        assert!(offset <= self.len - 4, "SQ doorbell offset out of bounds");
+        let data = unsafe { &*(self.buffer.addr as *const NamespaceData) };
+        let flba_index = (data.lba_size & 0xF) as usize;
+        let flba_data = (data.lba_format_support[flba_index] >> 16) & 0xFF;
 
-        let dbl = self.addr as usize + offset;
-
-        let comp_queue = NvmeCompQueue::new(len, dbl, &self.allocator)?;
-        let comp = self.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::create_io_completion_queue(
-                c_id,
-                q_id,
-                comp_queue.get_addr(),
-                (len - 1) as u16,
-            )
-        })?;
-
-        let dbl = self.addr as usize + 0x1000 + ((4 << self.dstrd) * (2 * q_id) as usize);
-        let sub_queue = NvmeSubQueue::new(len, dbl, &self.allocator)?;
-        let comp = self.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::create_io_submission_queue(
-                c_id,
-                q_id,
-                sub_queue.get_addr(),
-                (len - 1) as u16,
-                q_id,
-            )
-        })?;
-
-        self.q_id += 1;
-        Ok(NvmeQueuePair {
-            id: q_id,
-            sub_queue,
-            comp_queue,
-        })
-    }
-
-    pub fn delete_io_queue_pair(&mut self, qpair: NvmeQueuePair) -> Result<(), Box<dyn Error>> {
-        log::info!("Deleting i/o queue pair with id {}", qpair.id);
-        self.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::delete_io_submission_queue(c_id, qpair.id)
-        })?;
-        self.submit_and_complete_admin(|c_id, _| {
-            NvmeCommand::delete_io_completion_queue(c_id, qpair.id)
-        })?;
-        Ok(())
-    }
-
-    pub fn identify_namespace_list(&mut self, base: u32) -> Vec<u32> {
-        self.submit_and_complete_admin(|c_id, addr| {
-            NvmeCommand::identify_namespace_list(c_id, addr, base)
-        });
-
-        // TODO: idk bout this/don't hardcode len
-        let data: &[u32] =
-            unsafe { core::slice::from_raw_parts(self.buffer.virt as *const u32, 1024) };
-
-        data.iter()
-            .copied()
-            .take_while(|&id| id != 0)
-            .collect::<Vec<u32>>()
-    }
-
-    pub fn identify_namespace(&mut self, id: u32) -> (NvmeNamespace, u64) {
-        self.submit_and_complete_admin(|c_id, addr| {
-            NvmeCommand::identify_namespace(c_id, addr, id)
-        });
-
-        let namespace_data: IdentifyNamespaceData =
-            unsafe { *(self.buffer.virt as *const IdentifyNamespaceData) };
-
-        // let namespace_data = unsafe { *tmp_buff.virt };
-        let size = namespace_data.nsze;
-        let blocks = namespace_data.ncap;
-
-        // figure out block size
-        let flba_idx = (namespace_data.flbas & 0xF) as usize;
-        let flba_data = (namespace_data.lba_format_support[flba_idx] >> 16) & 0xFF;
-        let block_size = if !(9..32).contains(&flba_data) {
-            0
-        } else {
-            1 << flba_data
+        let block_size = match flba_data {
+            9..=32 => 1 << flba_data,
+            _ => anyhow::bail!("Block size < 512B is not supported"),
         };
 
-        // TODO: check metadata?
-        log::info!("Namespace {id}, Size: {size}, Blocks: {blocks}, Block size: {block_size}");
-
-        let namespace = NvmeNamespace {
+        let namespace = Namespace {
             id,
-            blocks,
             block_size,
+            block_count: data.capacity,
         };
         self.namespaces.insert(id, namespace);
-        (namespace, blocks * block_size)
+
+        Ok(namespace)
     }
 
-    // TODO: currently namespace 1 is hardcoded
-    pub fn write(&mut self, data: &impl DmaSlice, mut lba: u64) -> Result<(), Box<dyn Error>> {
-        for chunk in data.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512;
-            self.namespace_io(1, blocks, lba, chunk.phys_addr as u64, true)?;
-            lba += blocks;
+    pub fn identify_controller(&mut self) -> Result<(String, String, String)> {
+        self.exec_command(Command::identify(
+            self.admin_sq.tail as u16,
+            self.buffer.phys_addr,
+            IdentifyType::Controller,
+        ))?;
+
+        let extract_string = |start: usize, end: usize| -> String {
+            self.buffer.as_ref()[start..end]
+                .iter()
+                .take_while(|&&b| b != 0)
+                .map(|&b| b as char)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+
+        let serial = extract_string(4, 24);
+        let model = extract_string(24, 64);
+        let firmware = extract_string(64, 72);
+
+        Ok((model, serial, firmware))
+    }
+
+    pub fn identify_namespace_list(&mut self, base: u32) -> Result<Vec<u32>> {
+        self.exec_command(Command::identify(
+            self.admin_sq.tail as u16,
+            self.buffer.phys_addr,
+            IdentifyType::NamespaceList(base),
+        ))?;
+
+        let data = unsafe {
+            core::slice::from_raw_parts(
+                self.buffer.addr as *const u32,
+                4096 / core::mem::size_of::<u32>(),
+            )
+        };
+
+        Ok(data.iter().take_while(|&&id| id != 0).copied().collect())
+    }
+}
+
+impl<A: Allocator> Device<A> {
+    fn get_doorbell(&self, bell: Doorbell) -> *mut u32 {
+        let stride = 4 << self.doorbell_stride;
+        let base = self.address as usize + 0x1000;
+        let index = match bell {
+            Doorbell::SubTail(qid) => qid * 2,
+            Doorbell::CompHead(qid) => qid * 2 + 1,
+        };
+        (base + (index * stride) as usize) as *mut u32
+    }
+
+    fn write_doorbell(&self, bell: Doorbell, val: u32) {
+        unsafe {
+            self.get_doorbell(bell).write_volatile(val);
+        }
+    }
+}
+
+impl<A: Allocator> Device<A> {
+    pub fn exec_command(&mut self, cmd: Command) -> Result<Completion> {
+        let tail = self.admin_sq.push(cmd);
+        self.write_doorbell(Doorbell::SubTail(0), tail as u32);
+
+        let (head, entry) = self.admin_cq.pop();
+        self.write_doorbell(Doorbell::CompHead(0), head as u32);
+
+        let status = entry.status >> 1;
+        if status != 0 {
+            anyhow::bail!(
+                "Status: 0x{:x}, Code: 0x{:x}, Type: 0x{:x}",
+                status,
+                status & 0xFF,
+                (status >> 8) & 0x7
+            );
         }
 
+        Ok(entry)
+    }
+}
+
+impl<A: Allocator> Device<A> {
+    pub fn write(&mut self, data: &impl DmaSlice, lba: u64) -> Result<()> {
+        let ns_id = 1;
+        let ns = *self.namespaces.get(&ns_id).unwrap();
+        for (offset, chunk) in data.chunks(ns.block_size as usize).enumerate() {
+            let current = lba + offset as u64;
+            self.namespace_io(ns_id, 1, current, chunk.1 as u64, true)?;
+        }
         Ok(())
     }
 
-    pub fn read(&mut self, dest: &impl DmaSlice, mut lba: u64) -> Result<(), Box<dyn Error>> {
-        // let ns = *self.namespaces.get(&1).unwrap();
-        for chunk in dest.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512;
-            self.namespace_io(1, blocks, lba, chunk.phys_addr as u64, false)?;
-            lba += blocks;
+    pub fn read(&mut self, dest: &impl DmaSlice, lba: u64) -> Result<()> {
+        let ns_id = 1;
+        let ns = *self.namespaces.get(&ns_id).unwrap();
+        for (offset, chunk) in dest.chunks(ns.block_size as usize).enumerate() {
+            let current = lba + offset as u64;
+            self.namespace_io(ns_id, 1, current, chunk.1 as u64, false)?;
         }
         Ok(())
     }
 
-    pub fn write_copied(&mut self, data: &[u8], mut lba: u64) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
-        for chunk in data.chunks(128 * 4096) {
-            self.buffer[..chunk.len()].copy_from_slice(chunk);
-            let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
-            self.namespace_io(1, blocks, lba, self.buffer.phys as u64, true)?;
-            lba += blocks;
-        }
-
-        Ok(())
-    }
-
-    pub fn read_copied(&mut self, dest: &mut [u8], mut lba: u64) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
-        for chunk in dest.chunks_mut(128 * 4096) {
-            let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
-            self.namespace_io(1, blocks, lba, self.buffer.phys as u64, false)?;
-            lba += blocks;
-            chunk.copy_from_slice(&self.buffer[..chunk.len()]);
+    pub fn write_copied(&mut self, data: &[u8], lba: u64) -> Result<()> {
+        let ns_id = 1;
+        let ns = *self.namespaces.get(&ns_id).unwrap();
+        for (offset, chunk) in data.chunks(4096).enumerate() {
+            let blocks = (chunk.len() as u64).div_ceil(ns.block_size);
+            let current = lba + offset as u64;
+            self.buffer.as_mut()[..chunk.len()].copy_from_slice(chunk);
+            self.namespace_io(ns_id, blocks, current, self.buffer.phys_addr as u64, true)?;
         }
         Ok(())
     }
 
+    pub fn read_copied(&mut self, dest: &mut [u8], lba: u64) -> Result<()> {
+        let ns_id = 1;
+        let ns = *self.namespaces.get(&ns_id).unwrap();
+        for (offset, chunk) in dest.chunks_mut(4096).enumerate() {
+            let blocks = (chunk.len() as u64).div_ceil(ns.block_size);
+            let current = lba + offset as u64;
+            self.namespace_io(ns_id, blocks, current, self.buffer.phys_addr as u64, false)?;
+            chunk.copy_from_slice(&self.buffer.as_ref()[..chunk.len()]);
+        }
+        Ok(())
+    }
+}
+
+impl<A: Allocator> Device<A> {
     fn submit_io(
         &mut self,
-        ns: &NvmeNamespace,
+        ns: &Namespace,
         addr: u64,
         blocks: u64,
         lba: u64,
         write: bool,
     ) -> Option<usize> {
-        assert!(blocks > 0);
-        assert!(blocks <= 0x1_0000);
-        let q_id = 1;
+        assert!(blocks > 0 && blocks <= 0x1_0000);
 
         let bytes = blocks * ns.block_size;
-        let ptr1 = if bytes <= 4096 {
-            0
-        } else if bytes <= 8192 {
-            addr + 4096 // self.page_size
-        } else {
-            // idk if this works
-            let offset = (addr - self.buffer.phys as u64) / 8;
-            self.prp_list.phys as u64 + offset
+        let ptr1 = match bytes {
+            0..=4096 => 0,
+            4097..=8192 => addr + 4096,
+            _ => {
+                let offset = (addr - self.buffer.phys_addr as u64) / 8;
+                self.prp_list.phys_addr as u64 + offset
+            }
         };
 
-        let entry = if write {
-            NvmeCommand::io_write(
-                self.io_sq.tail as u16,
-                ns.id,
-                lba,
-                blocks as u16 - 1,
-                addr,
-                ptr1,
-            )
-        } else {
-            NvmeCommand::io_read(
-                self.io_sq.tail as u16,
-                ns.id,
-                lba,
-                blocks as u16 - 1,
-                addr,
-                ptr1,
-            )
-        };
-        self.io_sq.submit_checked(entry)
+        let entry = Command::read_write(
+            self.io_sq.tail as u16,
+            ns.id,
+            lba,
+            blocks as u16 - 1,
+            [addr, ptr1],
+            write,
+        );
+
+        self.io_sq.try_push(entry)
     }
 
-    fn complete_io(&mut self, step: u64) -> Option<u16> {
-        let q_id = 1;
+    fn complete_io(&mut self, step: u64) -> Result<u16> {
+        let queue_id = 1;
 
-        let (tail, c_entry, _) = self.io_cq.complete_n(step as usize);
-        self.write_reg_idx(NvmeArrayRegs::CQyHDBL, q_id as u16, tail as u32);
+        let (tail, c_entry) = self.io_cq.pop_n(step as usize);
+        self.write_doorbell(Doorbell::CompHead(queue_id), tail as u32);
 
         let status = c_entry.status >> 1;
         if status != 0 {
-            log::error!(
-                "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
+            anyhow::bail!(
+                "Status: 0x{:x}, Code 0x{:x}, Type: 0x{:x}",
                 status,
                 status & 0xFF,
                 (status >> 8) & 0x7
             );
-            log::error!("{:?}", c_entry);
-            return None;
         }
         self.stats.completions += 1;
-        Some(c_entry.sq_head)
+        Ok(c_entry.sq_head)
     }
 
+    fn namespace_io(
+        &mut self,
+        namespace_id: u32,
+        blocks: u64,
+        lba: u64,
+        addr: u64,
+        write: bool,
+    ) -> Result<()> {
+        let queue_id = 1;
+        let bytes = blocks * 512;
+
+        let ptr1 = match bytes {
+            b if b <= 4096 => 0,
+            b if b <= 8192 => addr + 4096,
+            _ => self.prp_list.phys_addr as u64,
+        };
+
+        let entry = Command::read_write(
+            self.io_sq.tail as u16,
+            namespace_id,
+            lba,
+            blocks as u16 - 1,
+            [addr, ptr1],
+            write,
+        );
+
+        let tail = self.io_sq.push(entry);
+        self.stats.submissions += 1;
+
+        self.write_doorbell(Doorbell::SubTail(queue_id), tail as u32);
+        self.io_sq.head = self.complete_io(1)? as usize;
+
+        Ok(())
+    }
+}
+
+impl<A: Allocator> Device<A> {
     pub fn batched_write(
         &mut self,
-        ns_id: u32,
+        namespace_id: u32,
         data: &[u8],
         mut lba: u64,
         batch_len: u64,
-    ) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&ns_id).unwrap();
-        let block_size = 512;
+    ) -> Result<()> {
         let q_id = 1;
-
+        let ns = *self.namespaces.get(&namespace_id).unwrap();
         for chunk in data.chunks(4096) {
-            self.buffer[..chunk.len()].copy_from_slice(chunk);
-            let tail = self.io_sq.tail;
-
-            let batch_len = core::cmp::min(batch_len, chunk.len() as u64 / block_size);
-            let batch_size = chunk.len() as u64 / batch_len;
-            let blocks = batch_size / ns.block_size;
-
-            for i in 0..batch_len {
-                if let Some(tail) = self.submit_io(
-                    &ns,
-                    self.buffer.phys as u64 + i * batch_size,
-                    blocks,
-                    lba,
-                    true,
-                ) {
-                    self.stats.submissions += 1;
-                    self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-                } else {
-                    log::error!("tail: {tail}, batch_len: {batch_len}, batch_size: {batch_size}, blocks: {blocks}");
-                }
-                lba += blocks;
-            }
-            self.io_sq.head = self.complete_io(batch_len).unwrap() as usize;
+            self.buffer.as_mut()[..chunk.len()].copy_from_slice(chunk);
+            self.process_io_batch(&ns, q_id, chunk.len(), batch_len, &mut lba, true)?;
         }
-
         Ok(())
     }
 
     pub fn batched_read(
         &mut self,
-        ns_id: u32,
+        namespace_id: u32,
         data: &mut [u8],
         mut lba: u64,
         batch_len: u64,
-    ) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&ns_id).unwrap();
-        let block_size = 512;
+    ) -> Result<()> {
         let q_id = 1;
-
+        let ns = *self.namespaces.get(&namespace_id).unwrap();
         for chunk in data.chunks_mut(4096) {
-            let tail = self.io_sq.tail;
-
-            let batch_len = core::cmp::min(batch_len, chunk.len() as u64 / block_size);
-            let batch_size = chunk.len() as u64 / batch_len;
-            let blocks = batch_size / ns.block_size;
-
-            for i in 0..batch_len {
-                if let Some(tail) = self.submit_io(
-                    &ns,
-                    self.buffer.phys as u64 + i * batch_size,
-                    blocks,
-                    lba,
-                    false,
-                ) {
-                    self.stats.submissions += 1;
-                    self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-                } else {
-                    log::error!("tail: {tail}, batch_len: {batch_len}, batch_size: {batch_size}, blocks: {blocks}");
-                }
-                lba += blocks;
-            }
-            self.io_sq.head = self.complete_io(batch_len).unwrap() as usize;
-            chunk.copy_from_slice(&self.buffer[..chunk.len()]);
+            self.process_io_batch(&ns, q_id, chunk.len(), batch_len, &mut lba, false)?;
+            chunk.copy_from_slice(&self.buffer.as_ref()[..chunk.len()]);
         }
         Ok(())
     }
 
-    #[inline(always)]
-    fn namespace_io(
+    fn process_io_batch(
         &mut self,
-        ns_id: u32,
-        blocks: u64,
-        lba: u64,
-        addr: u64,
-        write: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        assert!(blocks > 0);
-        assert!(blocks <= 0x1_0000);
+        ns: &Namespace,
+        queue_id: u16,
+        chunk_len: usize,
+        batch_len: u64,
+        lba: &mut u64,
+        is_write: bool,
+    ) -> Result<()> {
+        let block_size = ns.block_size;
+        let batch_len = batch_len.min(chunk_len as u64 / block_size);
+        let batch_size = chunk_len as u64 / batch_len;
+        let blocks = batch_size / block_size;
 
-        let q_id = 1;
+        for index in 0..batch_len {
+            let addr = self.buffer.phys_addr as u64 + index * batch_size;
+            let tail = self
+                .submit_io(ns, addr, blocks, *lba, is_write)
+                .ok_or(anyhow!("Failed to submit IO command"))?;
 
-        let bytes = blocks * 512;
-        let ptr1 = if bytes <= 4096 {
-            0
-        } else if bytes <= 8192 {
-            // self.buffer.phys as u64 + 4096 // self.page_size
-            addr + 4096 // self.page_size
-        } else {
-            self.prp_list.phys as u64
-        };
+            self.stats.submissions += 1;
+            self.write_doorbell(Doorbell::SubTail(queue_id), tail as u32);
+            *lba += blocks;
+        }
 
-        let entry = if write {
-            NvmeCommand::io_write(
-                self.io_sq.tail as u16,
-                ns_id,
-                lba,
-                blocks as u16 - 1,
-                addr,
-                ptr1,
-            )
-        } else {
-            NvmeCommand::io_read(
-                self.io_sq.tail as u16,
-                ns_id,
-                lba,
-                blocks as u16 - 1,
-                addr,
-                ptr1,
-            )
-        };
-
-        let tail = self.io_sq.submit(entry);
-        self.stats.submissions += 1;
-
-        self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-        self.io_sq.head = self.complete_io(1).unwrap() as usize;
+        self.io_sq.head = self.complete_io(batch_len)? as usize;
         Ok(())
     }
+}
 
-    fn submit_and_complete_admin<F: FnOnce(u16, usize) -> NvmeCommand>(
-        &mut self,
-        cmd_init: F,
-    ) -> Result<NvmeCompletion, Box<dyn Error>> {
-        let cid = self.admin_sq.tail;
-        let tail = self.admin_sq.submit(cmd_init(cid as u16, self.buffer.phys));
-        self.write_reg_idx(NvmeArrayRegs::SQyTDBL, 0, tail as u32);
+impl<A: Allocator> Device<A> {
+    pub fn create_io_queue_pair(&mut self, len: usize) -> Result<QueuePair<A>> {
+        let comp_queue = CompQueue::new(len, &self.allocator);
+        self.exec_command(Command::create_queue(
+            self.admin_sq.tail as u16,
+            self.queue_id,
+            comp_queue.address(),
+            (len - 1) as u16,
+            QueueType::Completion,
+            None,
+        ))?;
 
-        let (head, entry, _) = self.admin_cq.complete_spin();
-        self.write_reg_idx(NvmeArrayRegs::CQyHDBL, 0, head as u32);
-        let status = entry.status >> 1;
-        if status != 0 {
-            log::error!(
-                "Status: 0x{:x}, Status Code 0x{:x}, Status Code Type: 0x{:x}",
-                status,
-                status & 0xFF,
-                (status >> 8) & 0x7
-            );
-            return Err("Requesting i/o completion queue failed".into());
-        }
-        Ok(entry)
+        let sub_queue = SubQueue::new(len, &self.allocator);
+        self.exec_command(Command::create_queue(
+            self.admin_sq.tail as u16,
+            self.queue_id,
+            sub_queue.address(),
+            (len - 1) as u16,
+            QueueType::Submission,
+            Some(self.queue_id),
+        ))?;
+
+        self.queue_id += 1;
+        Ok(QueuePair {
+            id: self.queue_id,
+            device: self,
+            sub_queue,
+            comp_queue,
+        })
     }
 
-    pub fn clear_namespace(&mut self, ns_id: Option<u32>) {
-        let ns_id = if let Some(ns_id) = ns_id {
-            assert!(self.namespaces.contains_key(&ns_id));
-            ns_id
-        } else {
-            0xFFFF_FFFF
-        };
-        self.submit_and_complete_admin(|c_id, _| NvmeCommand::format_nvm(c_id, ns_id));
-    }
-
-    /// Sets Queue `qid` Tail Doorbell to `val`
-    fn write_reg_idx(&self, reg: NvmeArrayRegs, qid: u16, val: u32) {
-        match reg {
-            NvmeArrayRegs::SQyTDBL => unsafe {
-                core::ptr::write_volatile(
-                    (self.addr as usize + 0x1000 + ((4 << self.dstrd) * (2 * qid)) as usize)
-                        as *mut u32,
-                    val,
-                );
-            },
-            NvmeArrayRegs::CQyHDBL => unsafe {
-                core::ptr::write_volatile(
-                    (self.addr as usize + 0x1000 + ((4 << self.dstrd) * (2 * qid + 1)) as usize)
-                        as *mut u32,
-                    val,
-                );
-            },
-        }
-    }
-
-    /// Sets the register at `self.addr` + `reg` to `value`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
-    fn set_reg32(&self, reg: u32, value: u32) {
-        assert!(reg as usize <= self.len - 4, "memory access out of bounds");
-
-        unsafe {
-            core::ptr::write_volatile((self.addr as usize + reg as usize) as *mut u32, value);
-        }
-    }
-
-    /// Returns the register at `self.addr` + `reg`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
-    fn get_reg32(&self, reg: u32) -> u32 {
-        assert!(reg as usize <= self.len - 4, "memory access out of bounds");
-
-        unsafe { core::ptr::read_volatile((self.addr as usize + reg as usize) as *mut u32) }
-    }
-
-    /// Sets the register at `self.addr` + `reg` to `value`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
-    fn set_reg64(&self, reg: u32, value: u64) {
-        assert!(reg as usize <= self.len - 8, "memory access out of bounds");
-
-        unsafe {
-            core::ptr::write_volatile((self.addr as usize + reg as usize) as *mut u64, value);
-        }
-    }
-
-    /// Returns the register at `self.addr` + `reg`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `self.addr` + `reg` does not belong to the mapped memory of the pci device.
-    fn get_reg64(&self, reg: u64) -> u64 {
-        assert!(reg as usize <= self.len - 8, "memory access out of bounds");
-
-        unsafe { core::ptr::read_volatile((self.addr as usize + reg as usize) as *mut u64) }
+    pub fn delete_io_queue_pair(&mut self, qpair: QueuePair<A>) -> Result<()> {
+        let cmd_id = self.admin_sq.tail as u16;
+        let command = Command::delete_queue(cmd_id, qpair.id, QueueType::Submission);
+        self.exec_command(command)?;
+        let command = Command::delete_queue(cmd_id, qpair.id, QueueType::Completion);
+        self.exec_command(command)?;
+        Ok(())
     }
 }

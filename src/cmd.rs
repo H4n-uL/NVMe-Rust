@@ -1,261 +1,117 @@
-/// NVMe Spec 4.2
-/// Submission queue entry
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Debug, Default)]
 #[repr(C, packed)]
-pub struct NvmeCommand {
-    /// Opcode
-    pub opcode: u8,
-    /// Flags; FUSE (2 bits) | Reserved (4 bits) | PSDT (2 bits)
-    pub flags: u8,
-    /// Command ID
-    pub c_id: u16,
-    /// Namespace ID
-    pub ns_id: u32,
-    /// Reserved
-    pub _rsvd: u64,
-    /// Metadata pointer
-    pub md_ptr: u64,
-    /// Data pointer
-    pub d_ptr: [u64; 2],
-    /// Command dword 10
-    pub cdw10: u32,
-    /// Command dword 11
-    pub cdw11: u32,
-    /// Command dword 12
-    pub cdw12: u32,
-    /// Command dword 13
-    pub cdw13: u32,
-    /// Command dword 14
-    pub cdw14: u32,
-    /// Command dword 15
-    pub cdw15: u32,
+pub struct Command {
+    opcode: u8,
+    flags: u8,
+    cmd_id: u16,
+    namespace_id: u32,
+    _reserved: u64,
+    metadata_ptr: u64,
+    data_ptr: [u64; 2],
+    cmd_10: u32,
+    cmd_11: u32,
+    cmd_12: u32,
+    cmd_13: u32,
+    cmd_14: u32,
+    cmd_15: u32,
 }
 
-impl NvmeCommand {
-    pub fn create_io_completion_queue(c_id: u16, qid: u16, ptr: usize, size: u16) -> Self {
-        Self {
-            opcode: 5,
-            flags: 0,
-            c_id,
-            ns_id: 0,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [ptr as u64, 0],
-            cdw10: ((size as u32) << 16) | (qid as u32),
-            cdw11: 1, // Physically Contiguous
-            cdw12: 0,
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
-        }
-    }
+#[derive(Debug)]
+pub enum QueueType {
+    Submission,
+    Completion,
+}
 
-    pub fn create_io_submission_queue(
-        c_id: u16,
-        q_id: u16,
-        ptr: usize,
-        size: u16,
-        cq_id: u16,
+#[derive(Debug)]
+pub enum IdentifyType {
+    Namespace(u32),
+    Controller,
+    NamespaceList(u32),
+}
+
+const OPCODE_SUB_QUEUE_DELETE: u8 = 0;
+const OPCODE_WRITE: u8 = 1;
+const OPCODE_SUB_QUEUE_CREATE: u8 = 1;
+const OPCODE_READ: u8 = 2;
+const OPCODE_COMP_QUEUE_DELETE: u8 = 4;
+const OPCODE_COMP_QUEUE_CREATE: u8 = 5;
+const OPCODE_IDENTIFY: u8 = 6;
+
+impl Command {
+    pub fn read_write(
+        cmd_id: u16,
+        namespace_id: u32,
+        lba: u64,
+        block_count: u16,
+        data_ptr: [u64; 2],
+        is_write: bool,
     ) -> Self {
         Self {
-            opcode: 1,
-            flags: 0,
-            c_id,
-            ns_id: 0,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [ptr as u64, 0],
-            cdw10: ((size as u32) << 16) | (q_id as u32),
-            cdw11: ((cq_id as u32) << 16) | 1, /* Physically Contiguous */
-            //TODO: QPRIO
-            cdw12: 0, //TODO: NVMSETID
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
-        }
-    }
-
-    pub fn delete_io_submission_queue(c_id: u16, q_id: u16) -> Self {
-        Self {
-            opcode: 0,
-            c_id,
-            cdw10: q_id as u32,
+            opcode: if is_write { OPCODE_WRITE } else { OPCODE_READ },
+            cmd_id,
+            namespace_id,
+            data_ptr,
+            cmd_10: lba as u32,
+            cmd_11: (lba >> 32) as u32,
+            cmd_12: block_count as u32,
             ..Default::default()
         }
     }
 
-    pub fn delete_io_completion_queue(c_id: u16, q_id: u16) -> Self {
+    pub fn create_queue(
+        cmd_id: u16,
+        queue_id: u16,
+        address: usize,
+        size: u16,
+        target: QueueType,
+        cqueue_id: Option<u16>,
+    ) -> Command {
+        let (opcode, cmd_11) = match target {
+            QueueType::Submission => {
+                let id = cqueue_id.unwrap_or(0);
+                (OPCODE_SUB_QUEUE_CREATE, ((id as u32) << 16) | 1)
+            }
+            QueueType::Completion => (OPCODE_COMP_QUEUE_CREATE, 1),
+        };
+
         Self {
-            opcode: 4,
-            c_id,
-            cdw10: q_id as u32,
+            opcode,
+            cmd_id,
+            data_ptr: [address as u64, 0],
+            cmd_10: ((size as u32) << 16) | (queue_id as u32),
+            cmd_11,
             ..Default::default()
         }
     }
 
-    pub fn identify_namespace(c_id: u16, ptr: usize, ns_id: u32) -> Self {
-        Self {
-            opcode: 6,
-            flags: 0,
-            c_id,
-            ns_id,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [ptr as u64, 0],
-            cdw10: 0,
-            cdw11: 0,
-            cdw12: 0,
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
-        }
-    }
+    pub fn delete_queue(cmd_id: u16, queue_id: u16, target: QueueType) -> Self {
+        let opcode = match target {
+            QueueType::Submission => OPCODE_SUB_QUEUE_DELETE,
+            QueueType::Completion => OPCODE_COMP_QUEUE_DELETE,
+        };
 
-    pub fn identify_controller(c_id: u16, ptr: usize) -> Self {
         Self {
-            opcode: 6,
-            flags: 0,
-            c_id,
-            ns_id: 0,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [ptr as u64, 0],
-            cdw10: 1,
-            cdw11: 0,
-            cdw12: 0,
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
-        }
-    }
-
-    pub fn identify_namespace_list(c_id: u16, ptr: usize, base: u32) -> Self {
-        Self {
-            opcode: 6,
-            flags: 0,
-            c_id,
-            ns_id: base,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [ptr as u64, 0],
-            cdw10: 2,
-            cdw11: 0,
-            cdw12: 0,
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
-        }
-    }
-
-    pub fn get_features(_c_id: u16, ptr: usize, fid: u8) -> Self {
-        Self {
-            opcode: 0xA,
-            d_ptr: [ptr as u64, 0],
-            cdw10: u32::from(fid), // TODO: SEL
+            opcode,
+            cmd_id,
+            cmd_10: queue_id as u32,
             ..Default::default()
         }
     }
 
-    pub fn io_read(c_id: u16, ns_id: u32, lba: u64, blocks_1: u16, ptr0: u64, ptr1: u64) -> Self {
-        Self {
-            opcode: 2,
-            flags: 0,
-            c_id,
-            ns_id,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [ptr0, ptr1],
-            cdw10: lba as u32,
-            cdw11: (lba >> 32) as u32,
-            cdw12: blocks_1 as u32,
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
-        }
-    }
+    pub fn identify(cmd_id: u16, address: usize, target: IdentifyType) -> Self {
+        let (namespace_id, cmd_10) = match target {
+            IdentifyType::Namespace(id) => (id, 0),
+            IdentifyType::Controller => (0, 1),
+            IdentifyType::NamespaceList(base) => (base, 2),
+        };
 
-    pub fn io_write(c_id: u16, ns_id: u32, lba: u64, blocks_1: u16, ptr0: u64, ptr1: u64) -> Self {
         Self {
-            opcode: 1,
-            flags: 0,
-            c_id,
-            ns_id,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [ptr0, ptr1],
-            cdw10: lba as u32,
-            cdw11: (lba >> 32) as u32,
-            cdw12: blocks_1 as u32,
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
-        }
-    }
-
-    pub fn format_nvm(c_id: u16, ns_id: u32) -> Self {
-        Self {
-            opcode: 0x80,
-            flags: 0,
-            c_id,
-            ns_id,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [0, 0],
-            cdw10: 1 << 9,
-            // TODO: dealloc and prinfo bits
-            cdw11: 0,
-            cdw12: 0,
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
-        }
-    }
-
-    pub fn async_event_req(c_id: u16) -> Self {
-        Self {
-            opcode: 0xC,
-            flags: 0,
-            c_id,
-            ns_id: 0,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [0, 0],
-            cdw10: 0,
-            cdw11: 0,
-            cdw12: 0,
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
-        }
-    }
-
-    pub fn get_log_page(c_id: u16, numd: u32, ptr0: u64, ptr1: u64, lid: u8, lpid: u16) -> Self {
-        Self {
-            c_id,
-            d_ptr: [ptr0, ptr1],
-            cdw10: (numd << 16) | lid as u32,
-            cdw11: ((lpid as u32) << 16) | numd >> 16,
-            ..Self::default()
-        }
-    }
-
-    // not supported by samsung
-    pub fn write_zeroes(c_id: u16, ns_id: u32, slba: u64, nlb: u16, deac: bool) -> Self {
-        Self {
-            opcode: 8,
-            flags: 0,
-            c_id,
-            ns_id,
-            _rsvd: 0,
-            md_ptr: 0,
-            d_ptr: [0, 0],
-            cdw10: slba as u32,
-            // TODO: dealloc and prinfo bits
-            cdw11: (slba >> 32) as u32,
-            cdw12: ((deac as u32) << 25) | nlb as u32,
-            cdw13: 0,
-            cdw14: 0,
-            cdw15: 0,
+            opcode: OPCODE_IDENTIFY,
+            cmd_id,
+            namespace_id,
+            data_ptr: [address as u64, 0],
+            cmd_10,
+            ..Default::default()
         }
     }
 }

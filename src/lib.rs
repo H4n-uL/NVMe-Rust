@@ -1,17 +1,5 @@
 #![no_std]
-
-#[derive(Debug, Clone, Copy)]
-pub struct NvmeNamespace {
-    pub id: u32,
-    pub blocks: u64,
-    pub block_size: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct NvmeStats {
-    pub completions: u64,
-    pub submissions: u64,
-}
+#![allow(clippy::missing_safety_doc)]
 
 extern crate alloc;
 
