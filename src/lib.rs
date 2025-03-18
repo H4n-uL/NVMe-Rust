@@ -1,9 +1,12 @@
 #![no_std]
-#![allow(clippy::missing_safety_doc)]
 
 extern crate alloc;
 
-pub mod cmd;
-pub mod memory;
-pub mod nvme;
-pub mod queues;
+mod cmd;
+mod memory;
+mod nvme;
+mod queues;
+mod device;
+
+pub use device::Device;
+pub use memory::Allocator;

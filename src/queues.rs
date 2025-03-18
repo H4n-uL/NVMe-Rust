@@ -3,11 +3,11 @@ use core::hint::spin_loop;
 use super::cmd::Command;
 use super::memory::{Allocator, Dma};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Clone)]
 #[repr(C, packed)]
 pub struct Completion {
     command_specific: u32,
-    _reserved: u32,
+    _rsvd: u32,
     pub sq_head: u16,
     sq_id: u16,
     cmd_id: u16,

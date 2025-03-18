@@ -33,22 +33,19 @@ impl AsMut<[u8]> for Dma<u8> {
     }
 }
 
-pub trait DmaSlice: AsRef<[u8]> + AsMut<[u8]> {
-    fn chunks(&self, bytes: usize) -> impl Iterator<Item = (&[u8], usize)>;
-}
-
-impl DmaSlice for Dma<u8> {
-    fn chunks(&self, bytes: usize) -> impl Iterator<Item = (&[u8], usize)> {
-        let addr = self.addr.cast_const();
-        (0..self.count).step_by(bytes).map(move |offset| {
-            let len = core::cmp::min(bytes, self.count - offset);
-            let slice = unsafe { from_raw_parts(addr.add(offset), len) };
-            (slice, self.phys_addr + offset)
-        })
-    }
-}
-
+/// Allocates physically contiguous memory mapped into virtual address space.
+///
+/// Used for DMA operations requiring contiguous physical memory.
 pub trait Allocator {
+    /// Allocates a `size` byte region of memory.
+    ///
+    /// Returns a tuple of physical and virtual addresses of the allocated region's start.
+    ///
+    /// # Safety
+    ///
+    /// This is unsafe because:
+    /// - Returns uninitialized memory
+    /// - Implementation must ensure physical contiguity and valid virtual mapping
     unsafe fn allocate(&self, size: usize) -> (usize, usize);
 }
 
@@ -66,3 +63,18 @@ impl<T> Dma<T> {
         }
     }
 }
+
+// pub trait DmaSlice: AsRef<[u8]> + AsMut<[u8]> {
+//     fn chunks(&self, bytes: usize) -> impl Iterator<Item = (&[u8], usize)>;
+// }
+
+// impl DmaSlice for Dma<u8> {
+//     fn chunks(&self, bytes: usize) -> impl Iterator<Item = (&[u8], usize)> {
+//         let addr = self.addr.cast_const();
+//         (0..self.count).step_by(bytes).map(move |offset| {
+//             let len = core::cmp::min(bytes, self.count - offset);
+//             let slice = unsafe { from_raw_parts(addr.add(offset), len) };
+//             (slice, self.phys_addr + offset)
+//         })
+//     }
+// }
