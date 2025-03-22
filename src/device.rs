@@ -1,15 +1,15 @@
-use alloc::collections::btree_map::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use anyhow::Result;
 use core::hint::spin_loop;
 
 use crate::cmd::{Command, IdentifyType};
-use crate::memory::{Allocator, Dma};
-use crate::nvme::{IoQueueId, IoQueuePair, Namespace};
+use crate::error::{NvmeError, Result};
+use crate::memory::{Dma, NvmeAllocator};
+use crate::nvme::{IoQueueId, IoQueuePair};
 use crate::queues::{CompQueue, Completion};
 use crate::queues::{QUEUE_LENGTH, SubQueue};
 
+/// NVMe controller registers.
 #[derive(Debug)]
 #[allow(unused, clippy::upper_case_acronyms)]
 pub enum Register {
@@ -35,12 +35,14 @@ pub enum Register {
     ACQ = 0x30,
 }
 
+/// NVMe doorbell register.
 #[derive(Clone, Debug)]
 pub enum Doorbell {
     SubTail(u16),
     CompHead(u16),
 }
 
+/// NVMe namespace data structure.
 #[derive(Debug, Clone)]
 #[repr(C, packed)]
 struct NamespaceData {
@@ -52,33 +54,59 @@ struct NamespaceData {
     lba_format_support: [u32; 16],
 }
 
-pub struct Device<A> {
-    address: *mut u8,
-    namespaces: BTreeMap<u32, Namespace>,
-    allocator: A,
-    doorbell_stride: u16,
-    admin_sq: SubQueue,
-    admin_cq: CompQueue,
-    admin_buffer: Dma<u8>,
+/// A data structure that holds some
+/// common information about some nvme controllers.
+#[derive(Default, Debug, Clone)]
+pub struct NvmeControllerData {
+    /// Serial number
+    pub serial_number: String,
+    /// Model number
+    pub model_number: String,
+    /// Firmware revision
+    pub firmware_revision: String,
+    /// Maximum transfer size (in bytes)
+    pub max_transfer_size: u64,
 }
 
-unsafe impl<A> Send for Device<A> {}
-unsafe impl<A> Sync for Device<A> {}
+#[derive(Debug, Clone)]
+pub struct NvmeNamespace {
+    pub id: u32,
+    pub block_count: u64,
+    pub block_size: u64,
+}
 
-impl<A: Allocator> Device<A> {
+/// A structure representing an NVMe controller device.
+pub struct NvmeDevice<A> {
+    address: *mut u8,
+    pub(crate) allocator: A,
+    min_pagesize: usize,
+    doorbell_stride: u8,
+    pub(crate) admin_sq: SubQueue,
+    admin_cq: CompQueue,
+    admin_buffer: Dma<[u8; 4096]>,
+    /// Some useful information of the controller
+    pub controller_data: NvmeControllerData,
+}
+
+unsafe impl<A> Send for NvmeDevice<A> {}
+unsafe impl<A> Sync for NvmeDevice<A> {}
+
+impl<A: NvmeAllocator> NvmeDevice<A> {
     pub fn init(address: usize, allocator: A) -> Result<Self> {
         let mut device = Self {
             address: address as _,
-            namespaces: BTreeMap::new(),
             doorbell_stride: 0,
             admin_sq: SubQueue::new(QUEUE_LENGTH, &allocator),
             admin_cq: CompQueue::new(QUEUE_LENGTH, &allocator),
-            admin_buffer: Dma::allocate(&allocator, 4096),
+            admin_buffer: Dma::allocate(&allocator),
+            controller_data: Default::default(),
+            min_pagesize: Default::default(),
             allocator,
         };
 
-        let cap = device.get_reg::<u64>(Register::CAP) >> 32;
-        device.doorbell_stride = cap as u16 & 0xF;
+        let cap = device.get_reg::<u64>(Register::CAP);
+        device.doorbell_stride = (cap >> 32) as u8 & 0xF;
+        device.min_pagesize = 1 << (((cap >> 48) as u8 & 0xF) + 12);
 
         device.set_reg::<u32>(Register::CC, device.get_reg::<u32>(Register::CC) & !1);
         while device.get_reg::<u32>(Register::CSTS) & 1 == 1 {
@@ -97,11 +125,14 @@ impl<A: Allocator> Device<A> {
         while device.get_reg::<u32>(Register::CSTS) & 1 == 0 {
             spin_loop();
         }
+
+        device.controller_data = device.identify_controller()?;
+
         Ok(device)
     }
 }
 
-impl<A: Allocator> Device<A> {
+impl<A: NvmeAllocator> NvmeDevice<A> {
     fn get_reg<T>(&self, reg: Register) -> T {
         let address = self.address as usize + reg as usize;
         unsafe { (address as *const T).read_volatile() }
@@ -113,34 +144,8 @@ impl<A: Allocator> Device<A> {
     }
 }
 
-impl<A: Allocator> Device<A> {
-    pub fn identify_namespace(&mut self, id: u32) -> Result<Namespace> {
-        self.exec_admin(Command::identify(
-            self.admin_sq.tail as u16,
-            self.admin_buffer.phys_addr,
-            IdentifyType::Namespace(id),
-        ))?;
-
-        let data = unsafe { &*(self.admin_buffer.addr as *const NamespaceData) };
-        let flba_index = (data.lba_size & 0xF) as usize;
-        let flba_data = (data.lba_format_support[flba_index] >> 16) & 0xFF;
-
-        let block_size = match flba_data {
-            9..=32 => 1 << flba_data,
-            _ => anyhow::bail!("Block size < 512B is not supported"),
-        };
-
-        let namespace = Namespace {
-            id,
-            block_size,
-            block_count: data.capacity,
-        };
-        self.namespaces.insert(id, namespace.clone());
-
-        Ok(namespace)
-    }
-
-    pub fn identify_controller(&mut self) -> Result<(String, String, String)> {
+impl<A: NvmeAllocator> NvmeDevice<A> {
+    fn identify_controller(&mut self) -> Result<NvmeControllerData> {
         self.exec_admin(Command::identify(
             self.admin_sq.tail as u16,
             self.admin_buffer.phys_addr,
@@ -148,7 +153,7 @@ impl<A: Allocator> Device<A> {
         ))?;
 
         let extract_string = |start: usize, end: usize| -> String {
-            self.admin_buffer.as_ref()[start..end]
+            self.admin_buffer[start..end]
                 .iter()
                 .flat_map(|&b| char::from_u32(b as u32))
                 .collect::<String>()
@@ -160,29 +165,55 @@ impl<A: Allocator> Device<A> {
         let model = extract_string(24, 64);
         let firmware = extract_string(64, 72);
 
-        Ok((model, serial, firmware))
+        let max_pages = 1 << self.admin_buffer.as_ref()[77];
+        let max_transfer_size = (max_pages * self.min_pagesize) as u64;
+
+        Ok(NvmeControllerData {
+            serial_number: serial,
+            model_number: model,
+            firmware_revision: firmware,
+            max_transfer_size,
+        })
     }
 
-    pub fn identify_namespace_list(&mut self, base: u32) -> Result<Vec<u32>> {
+    pub fn identify_namespaces(&mut self, base: u32) -> Result<Vec<NvmeNamespace>> {
         self.exec_admin(Command::identify(
             self.admin_sq.tail as u16,
             self.admin_buffer.phys_addr,
             IdentifyType::NamespaceList(base),
         ))?;
 
-        let data = unsafe {
-            core::slice::from_raw_parts(
-                self.admin_buffer.addr as *const u32,
-                4096 / core::mem::size_of::<u32>(),
-            )
+        let ids = self
+            .admin_buffer
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .filter(|&id| id != 0)
+            .collect::<Vec<u32>>();
+
+        let get_namespace = |&id| {
+            self.exec_admin(Command::identify(
+                self.admin_sq.tail as u16,
+                self.admin_buffer.phys_addr,
+                IdentifyType::Namespace(id),
+            ))?;
+
+            let data = unsafe { &*(self.admin_buffer.addr as *const NamespaceData) };
+            let flba_index = (data.lba_size & 0xF) as usize;
+            let flba_data = (data.lba_format_support[flba_index] >> 16) & 0xFF;
+
+            Ok(NvmeNamespace {
+                id,
+                block_size: 1 << flba_data,
+                block_count: data.capacity,
+            })
         };
 
-        Ok(data.iter().take_while(|&&id| id != 0).copied().collect())
+        ids.iter().map(get_namespace).collect()
     }
 }
 
-impl<A: Allocator> Device<A> {
-    pub fn write_doorbell(&self, bell: Doorbell, val: u32) {
+impl<A: NvmeAllocator> NvmeDevice<A> {
+    pub(crate) fn write_doorbell(&self, bell: Doorbell, val: u32) {
         let stride = 4 << self.doorbell_stride;
         let base = self.address as usize + 0x1000;
         let index = match bell {
@@ -194,7 +225,7 @@ impl<A: Allocator> Device<A> {
         unsafe { (addr as *mut u32).write_volatile(val) }
     }
 
-    pub fn exec_admin(&mut self, cmd: Command) -> Result<Completion> {
+    pub(crate) fn exec_admin(&mut self, cmd: Command) -> Result<Completion> {
         let tail = self.admin_sq.push(cmd);
         self.write_doorbell(Doorbell::SubTail(0), tail as u32);
 
@@ -203,15 +234,19 @@ impl<A: Allocator> Device<A> {
 
         let status = (entry.status >> 1) & 0xff;
         if status != 0 {
-            anyhow::bail!("Command failed! Status: 0x{:x}", status);
+            return Err(NvmeError::CommandFailed(status));
         }
 
         Ok(entry)
     }
 }
 
-impl<A: Allocator> Device<A> {
-    pub fn create_io_queue_pair(&mut self, len: usize) -> Result<IoQueuePair<A>> {
+impl<'a, A: NvmeAllocator> NvmeDevice<A> {
+    pub fn create_io_queue_pair(
+        &'a mut self,
+        namespace: &'a NvmeNamespace,
+        len: usize,
+    ) -> Result<IoQueuePair<'a, A>> {
         let queue_id = IoQueueId::new();
 
         let comp_queue = CompQueue::new(len, &self.allocator);
@@ -234,9 +269,10 @@ impl<A: Allocator> Device<A> {
         Ok(IoQueuePair {
             id: queue_id,
             device: self,
+            namespace,
             sub_queue,
             comp_queue,
-            buffer: Dma::allocate(&self.allocator, 4096),
+            prp_manager: Default::default(),
         })
     }
 

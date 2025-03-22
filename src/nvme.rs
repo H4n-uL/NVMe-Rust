@@ -1,18 +1,11 @@
-use anyhow::{Result, anyhow};
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use crate::cmd::Command;
-use crate::device::{Device, Doorbell};
-use crate::memory::{Allocator, Dma};
+use crate::device::{Doorbell, NvmeDevice, NvmeNamespace};
+use crate::error::{NvmeError, Result};
+use crate::memory::{NvmeAllocator, PrpManager, PrpResult};
 use crate::queues::{CompQueue, SubQueue};
-
-#[derive(Debug, Clone)]
-pub struct Namespace {
-    pub id: u32,
-    pub block_count: u64,
-    pub block_size: u64,
-}
 
 #[derive(Debug, Clone)]
 pub struct IoQueueId(pub u16);
@@ -25,7 +18,6 @@ impl Deref for IoQueueId {
     }
 }
 
-#[allow(clippy::new_without_default)]
 impl IoQueueId {
     pub fn new() -> Self {
         static NEXT_ID: AtomicU16 = AtomicU16::new(1);
@@ -34,40 +26,48 @@ impl IoQueueId {
 }
 
 pub struct IoQueuePair<'a, A> {
-    pub id: IoQueueId,
-    pub buffer: Dma<u8>,
-    pub device: &'a Device<A>,
-    pub sub_queue: SubQueue,
-    pub comp_queue: CompQueue,
+    pub(crate) id: IoQueueId,
+    pub(crate) device: &'a NvmeDevice<A>,
+    pub(crate) namespace: &'a NvmeNamespace,
+    pub(crate) sub_queue: SubQueue,
+    pub(crate) comp_queue: CompQueue,
+    pub(crate) prp_manager: PrpManager,
 }
 
-impl<A: Allocator> IoQueuePair<'_, A> {
+impl<A: NvmeAllocator> IoQueuePair<'_, A> {
     fn submit_io(
         &mut self,
-        namespace_id: u32,
-        blocks: u64,
+        blocks: u16,
         lba: u64,
-        addr: u64,
+        address: usize,
         write: bool,
-    ) -> Result<()> {
+    ) -> Result<PrpResult> {
+        let bytes = blocks as usize * 512;
+
+        let prp_result = self
+            .prp_manager
+            .create(&self.device.allocator, address, bytes)?;
+
+        let prp = prp_result.get_prp();
+
         let command = Command::read_write(
             *self.id << 10 | self.sub_queue.tail as u16,
-            namespace_id,
+            self.namespace.id,
             lba,
-            blocks as u16 - 1,
-            [addr, 0],
+            blocks - 1,
+            [prp.0 as u64, prp.1 as u64],
             write,
         );
 
         let tail = self
             .sub_queue
             .try_push(command)
-            .ok_or(anyhow!("Submission queue is full"))?;
+            .ok_or(NvmeError::QueueFull)?;
 
         let doorbell = Doorbell::SubTail(*self.id);
         self.device.write_doorbell(doorbell, tail as u32);
 
-        Ok(())
+        Ok(prp_result)
     }
 
     fn complete_io(&mut self, step: u64) -> Result<u16> {
@@ -78,40 +78,43 @@ impl<A: Allocator> IoQueuePair<'_, A> {
 
         let status = (entry.status >> 1) & 0xff;
         if status != 0 {
-            anyhow::bail!("Command failed! Status: 0x{:x}", status);
+            return Err(NvmeError::CommandFailed(status));
         }
 
         Ok(entry.sq_head)
     }
 }
 
-impl<A: Allocator> IoQueuePair<'_, A> {
-    pub fn write_copied(&mut self, data: &[u8], lba: u64) -> Result<()> {
-        let ns_id = 1;
-        // let ns = *self.namespaces.get(&ns_id).unwrap();
-        for (offset, chunk) in data.chunks(4096).enumerate() {
-            let blocks = (chunk.len() as u64).div_ceil(512);
-            let current = lba + offset as u64;
-            self.buffer.as_mut()[..chunk.len()].copy_from_slice(chunk);
-
-            self.submit_io(ns_id, blocks, current, self.buffer.phys_addr as u64, true)?;
-            self.sub_queue.head = self.complete_io(1)? as usize;
+impl<A: NvmeAllocator> IoQueuePair<'_, A> {
+    fn handle_read_write(
+        &mut self,
+        bytes: u64,
+        lba: u64,
+        address: usize,
+        write: bool,
+    ) -> Result<()> {
+        if bytes > self.device.controller_data.max_transfer_size {
+            return Err(NvmeError::IoSizeExceedsMdts);
         }
+        if bytes % self.namespace.block_size != 0 {
+            return Err(NvmeError::InvalidBufferSize);
+        }
+
+        let blocks = (bytes / self.namespace.block_size) as u16;
+        let prp_result = self.submit_io(blocks, lba, address, write)?;
+        self.sub_queue.head = self.complete_io(1)? as usize;
+        self.prp_manager.release(prp_result, &self.device.allocator);
+
         Ok(())
     }
+}
 
-    pub fn read_copied(&mut self, dest: &mut [u8], lba: u64) -> Result<()> {
-        let ns_id = 1;
-        // let ns = *self.namespaces.get(&ns_id).unwrap();
-        for (offset, chunk) in dest.chunks_mut(4096).enumerate() {
-            let blocks = (chunk.len() as u64).div_ceil(512);
-            let current = lba + offset as u64;
+impl<A: NvmeAllocator> IoQueuePair<'_, A> {
+    pub fn read(&mut self, dest: *mut u8, bytes: usize, lba: u64) -> Result<()> {
+        self.handle_read_write(bytes as u64, lba, dest as usize, false)
+    }
 
-            self.submit_io(ns_id, blocks, current, self.buffer.phys_addr as u64, false)?;
-            self.sub_queue.head = self.complete_io(1)? as usize;
-
-            chunk.copy_from_slice(&self.buffer.as_ref()[..chunk.len()]);
-        }
-        Ok(())
+    pub fn write(&mut self, src: *const u8, bytes: usize, lba: u64) -> Result<()> {
+        self.handle_read_write(bytes as u64, lba, src as usize, true)
     }
 }

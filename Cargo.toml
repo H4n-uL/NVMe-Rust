@@ -1,11 +1,13 @@
 [package]
 name = "nvme"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/lihanrui2913/nvme"
 description = "A simple NVMe driver"
 license = "MIT/Apache-2.0"
 keywords = ["nvme", "pcie", "no_std"]
 
-[dependencies]
-anyhow = { version = "1.0.95", default-features = false }
+[dependencies.crossbeam-queue]
+version = "0.3.12"
+features = ["alloc"]
+default-features = false

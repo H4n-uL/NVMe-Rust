@@ -1,6 +1,6 @@
 #[derive(Debug, Default)]
 #[repr(C, packed)]
-pub struct Command {
+pub(crate) struct Command {
     /// Opcode
     opcode: u8,
     /// Flags; FUSE (2 bits) | Reserved (4 bits) | PSDT (2 bits)
@@ -30,7 +30,7 @@ pub struct Command {
 }
 
 #[derive(Debug)]
-pub enum IdentifyType {
+pub(crate) enum IdentifyType {
     Namespace(u32),
     Controller,
     NamespaceList(u32),

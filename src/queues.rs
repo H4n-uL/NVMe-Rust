@@ -1,7 +1,7 @@
 use core::hint::spin_loop;
 
 use super::cmd::Command;
-use super::memory::{Allocator, Dma};
+use super::memory::{Dma, NvmeAllocator};
 
 #[derive(Debug, Clone)]
 #[repr(C, packed)]
@@ -24,9 +24,9 @@ pub struct SubQueue {
 }
 
 impl SubQueue {
-    pub fn new<A: Allocator>(len: usize, allocator: &A) -> Self {
+    pub fn new<A: NvmeAllocator>(len: usize, allocator: &A) -> Self {
         Self {
-            slots: Dma::allocate(allocator, 1),
+            slots: Dma::allocate(allocator),
             head: 0,
             tail: 0,
             len: len.min(QUEUE_LENGTH),
@@ -35,10 +35,6 @@ impl SubQueue {
 
     pub fn address(&self) -> usize {
         self.slots.phys_addr
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.head == self.tail
     }
 
     pub fn is_full(&self) -> bool {
@@ -68,9 +64,9 @@ pub struct CompQueue {
 }
 
 impl CompQueue {
-    pub fn new<A: Allocator>(len: usize, allocator: &A) -> Self {
+    pub fn new<A: NvmeAllocator>(len: usize, allocator: &A) -> Self {
         Self {
-            slots: Dma::allocate(allocator, 1),
+            slots: Dma::allocate(allocator),
             head: 0,
             phase: true,
             len: len.min(QUEUE_LENGTH),
