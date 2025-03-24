@@ -30,6 +30,9 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     // Init the NVMe controller
     let controller = NvmeDevice::init(virtual_address, Allocator)?;
 
+    // Some useful data you may want to see
+    let _controller_data = &controller.data;
+
     // Identify all namespaces (base 0)
     let namespaces = controller.identify_namespaces(0)?;
 
@@ -40,9 +43,9 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     let _disk_size = namespace.block_count * namespace.block_size;
 
     // Create a I/O queue pair to perform IO operations
-    let mut qpair = controller.create_io_queue_pair::<64>(namespace)?;
+    let mut qpair = controller.create_io_queue_pair(namespacem, 64)?;
 
-    // Should not be larger than controller.controller_data.max_transfer_size
+    // Should not be larger than controller.data.max_transfer_size
     const TEST_LENGTH: usize = 524288;
 
     // Create a 4096 byte aligned read buffer
