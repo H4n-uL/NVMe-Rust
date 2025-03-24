@@ -7,7 +7,7 @@ pub enum NvmeError {
     /// The submission queue is full.
     QueueFull,
 
-    /// Length must be a multiple of block size.
+    /// Buffer size must be a multiple of the block size.
     InvalidBufferSize,
 
     /// Target address must be aligned to dword.
@@ -34,7 +34,7 @@ impl Display for NvmeError {
                 write!(f, "The submission queue is full")
             }
             NvmeError::InvalidBufferSize => {
-                write!(f, "Length must be a multiple of block size")
+                write!(f, "Buffer size must be a multiple of the block size.")
             }
             NvmeError::NotAlignedToDword => {
                 write!(f, "Target address must be aligned to dword")

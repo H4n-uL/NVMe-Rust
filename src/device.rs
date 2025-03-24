@@ -1,3 +1,4 @@
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::hint::spin_loop;
@@ -6,8 +7,13 @@ use crate::cmd::{Command, IdentifyType};
 use crate::error::{NvmeError, Result};
 use crate::memory::{Dma, NvmeAllocator};
 use crate::nvme::{IoQueueId, IoQueuePair};
-use crate::queues::{CompQueue, Completion};
-use crate::queues::{QUEUE_LENGTH, SubQueue};
+use crate::queues::{CompQueue, Completion, SubQueue};
+
+/// Default size of an admin queue.
+///
+/// Here choose 64 which can exactly fit into a page,
+/// which is usually enough for most cases.
+const ADMIN_QUEUE_SIZE: usize = 64;
 
 /// NVMe controller registers.
 #[derive(Debug)]
@@ -37,9 +43,40 @@ pub enum Register {
 
 /// NVMe doorbell register.
 #[derive(Clone, Debug)]
-pub enum Doorbell {
+pub(crate) enum Doorbell {
     SubTail(u16),
     CompHead(u16),
+}
+
+/// A helper for calculating doorbell addresses.
+///
+/// It is separate so that the `IoQueuePair` can reference it
+/// instead of the entire controller, thus not resulting into
+/// the problem of creating mutable references multiple times.
+#[derive(Clone, Debug)]
+pub(crate) struct DoorbellHelper {
+    address: usize,
+    stride: u8,
+}
+
+impl DoorbellHelper {
+    /// Create a new `DoorbellHelper` instance.
+    pub fn new(address: usize, stride: u8) -> Self {
+        Self { address, stride }
+    }
+
+    /// Write a value to specified doorbell register.
+    pub fn write(&self, bell: Doorbell, val: u32) {
+        let stride = 4 << self.stride;
+        let base = self.address + 0x1000;
+        let index = match bell {
+            Doorbell::SubTail(qid) => qid * 2,
+            Doorbell::CompHead(qid) => qid * 2 + 1,
+        };
+
+        let addr = base + (index * stride) as usize;
+        unsafe { (addr as *mut u32).write_volatile(val) }
+    }
 }
 
 /// NVMe namespace data structure.
@@ -68,22 +105,26 @@ pub struct NvmeControllerData {
     pub max_transfer_size: u64,
 }
 
+/// A structure representing an NVMe namespace.
 #[derive(Debug, Clone)]
 pub struct NvmeNamespace {
+    /// Namespace ID
     pub id: u32,
+    /// Block count
     pub block_count: u64,
+    /// Block size (in bytes)
     pub block_size: u64,
 }
 
 /// A structure representing an NVMe controller device.
 pub struct NvmeDevice<A> {
     address: *mut u8,
-    pub(crate) allocator: A,
+    pub(crate) allocator: Rc<A>,
     min_pagesize: usize,
-    doorbell_stride: u8,
-    pub(crate) admin_sq: SubQueue,
-    admin_cq: CompQueue,
+    pub(crate) admin_sq: SubQueue<ADMIN_QUEUE_SIZE>,
+    admin_cq: CompQueue<ADMIN_QUEUE_SIZE>,
     admin_buffer: Dma<[u8; 4096]>,
+    doorbell_helper: DoorbellHelper,
     /// Some useful information of the controller
     pub controller_data: NvmeControllerData,
 }
@@ -92,21 +133,29 @@ unsafe impl<A> Send for NvmeDevice<A> {}
 unsafe impl<A> Sync for NvmeDevice<A> {}
 
 impl<A: NvmeAllocator> NvmeDevice<A> {
+    /// Initialize a NVMe controller device.
+    ///
+    /// The `address` is the base address of the controller and the
+    /// `allocator` is the global DMA allocator for the entire NVMe device.
     pub fn init(address: usize, allocator: A) -> Result<Self> {
         let mut device = Self {
             address: address as _,
-            doorbell_stride: 0,
-            admin_sq: SubQueue::new(QUEUE_LENGTH, &allocator),
-            admin_cq: CompQueue::new(QUEUE_LENGTH, &allocator),
+            admin_sq: SubQueue::new(&allocator),
+            admin_cq: CompQueue::new(&allocator),
             admin_buffer: Dma::allocate(&allocator),
+            doorbell_helper: DoorbellHelper::new(address, 0),
             controller_data: Default::default(),
             min_pagesize: Default::default(),
-            allocator,
+            allocator: Rc::new(allocator),
         };
 
         let cap = device.get_reg::<u64>(Register::CAP);
-        device.doorbell_stride = (cap >> 32) as u8 & 0xF;
+        let doorbell_stride = (cap >> 32) as u8 & 0xF;
+        device.doorbell_helper = DoorbellHelper::new(address, doorbell_stride);
         device.min_pagesize = 1 << (((cap >> 48) as u8 & 0xF) + 12);
+
+        let max_queues_entrys = (cap & 0x7FFF) as u16;
+        log::info!("Max queues: {}", max_queues_entrys);
 
         device.set_reg::<u32>(Register::CC, device.get_reg::<u32>(Register::CC) & !1);
         while device.get_reg::<u32>(Register::CSTS) & 1 == 1 {
@@ -115,7 +164,7 @@ impl<A: NvmeAllocator> NvmeDevice<A> {
 
         device.set_reg::<u64>(Register::ASQ, device.admin_sq.address() as u64);
         device.set_reg::<u64>(Register::ACQ, device.admin_cq.address() as u64);
-        let aqa = (QUEUE_LENGTH as u32 - 1) << 16 | (QUEUE_LENGTH as u32 - 1);
+        let aqa = (ADMIN_QUEUE_SIZE as u32 - 1) << 16 | (ADMIN_QUEUE_SIZE as u32 - 1);
         device.set_reg::<u32>(Register::AQA, aqa);
 
         let cc = device.get_reg::<u32>(Register::CC) & 0xFF00_000F;
@@ -133,11 +182,13 @@ impl<A: NvmeAllocator> NvmeDevice<A> {
 }
 
 impl<A: NvmeAllocator> NvmeDevice<A> {
+    /// Helper function to read a NVMe register.
     fn get_reg<T>(&self, reg: Register) -> T {
         let address = self.address as usize + reg as usize;
         unsafe { (address as *const T).read_volatile() }
     }
 
+    /// Helper function to write a NVMe register.
     fn set_reg<T>(&self, reg: Register, value: T) {
         let address = self.address as usize + reg as usize;
         unsafe { (address as *mut T).write_volatile(value) }
@@ -213,24 +264,14 @@ impl<A: NvmeAllocator> NvmeDevice<A> {
 }
 
 impl<A: NvmeAllocator> NvmeDevice<A> {
-    pub(crate) fn write_doorbell(&self, bell: Doorbell, val: u32) {
-        let stride = 4 << self.doorbell_stride;
-        let base = self.address as usize + 0x1000;
-        let index = match bell {
-            Doorbell::SubTail(qid) => qid * 2,
-            Doorbell::CompHead(qid) => qid * 2 + 1,
-        };
-
-        let addr = base + (index * stride) as usize;
-        unsafe { (addr as *mut u32).write_volatile(val) }
-    }
-
     pub(crate) fn exec_admin(&mut self, cmd: Command) -> Result<Completion> {
         let tail = self.admin_sq.push(cmd);
-        self.write_doorbell(Doorbell::SubTail(0), tail as u32);
+        self.doorbell_helper
+            .write(Doorbell::SubTail(0), tail as u32);
 
         let (head, entry) = self.admin_cq.pop();
-        self.write_doorbell(Doorbell::CompHead(0), head as u32);
+        self.doorbell_helper
+            .write(Doorbell::CompHead(0), head as u32);
 
         let status = (entry.status >> 1) & 0xff;
         if status != 0 {
@@ -241,42 +282,45 @@ impl<A: NvmeAllocator> NvmeDevice<A> {
     }
 }
 
-impl<'a, A: NvmeAllocator> NvmeDevice<A> {
-    pub fn create_io_queue_pair(
-        &'a mut self,
+impl<A: NvmeAllocator> NvmeDevice<A> {
+    pub fn create_io_queue_pair<'a, const SIZE: usize>(
+        &mut self,
         namespace: &'a NvmeNamespace,
-        len: usize,
-    ) -> Result<IoQueuePair<'a, A>> {
+    ) -> Result<IoQueuePair<'a, A, SIZE>> {
         let queue_id = IoQueueId::new();
 
-        let comp_queue = CompQueue::new(len, &self.allocator);
+        let comp_queue = CompQueue::new(self.allocator.as_ref());
         self.exec_admin(Command::create_completion_queue(
             self.admin_sq.tail as u16,
             *queue_id,
             comp_queue.address(),
-            (len - 1) as u16,
+            (SIZE - 1) as u16,
         ))?;
 
-        let sub_queue = SubQueue::new(len, &self.allocator);
+        let sub_queue = SubQueue::new(self.allocator.as_ref());
         self.exec_admin(Command::create_submission_queue(
             self.admin_sq.tail as u16,
             *queue_id,
             sub_queue.address(),
-            (len - 1) as u16,
+            (SIZE - 1) as u16,
             *queue_id,
         ))?;
 
-        Ok(IoQueuePair {
-            id: queue_id,
-            device: self,
+        Ok(IoQueuePair::new(
+            queue_id,
             namespace,
+            self.doorbell_helper.clone(),
             sub_queue,
             comp_queue,
-            prp_manager: Default::default(),
-        })
+            self.allocator.clone(),
+            self.controller_data.max_transfer_size,
+        ))
     }
 
-    pub fn delete_io_queue_pair(&mut self, qpair: IoQueuePair<A>) -> Result<()> {
+    pub fn delete_io_queue_pair<const SIZE: usize>(
+        &mut self,
+        qpair: IoQueuePair<A, SIZE>,
+    ) -> Result<()> {
         let cmd_id = self.admin_sq.tail as u16;
         let command = Command::delete_submission_queue(cmd_id, *qpair.id);
         self.exec_admin(command)?;

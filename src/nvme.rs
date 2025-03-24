@@ -1,8 +1,10 @@
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU16, Ordering};
 
+use alloc::rc::Rc;
+
 use crate::cmd::Command;
-use crate::device::{Doorbell, NvmeDevice, NvmeNamespace};
+use crate::device::{Doorbell, DoorbellHelper, NvmeNamespace};
 use crate::error::{NvmeError, Result};
 use crate::memory::{NvmeAllocator, PrpManager, PrpResult};
 use crate::queues::{CompQueue, SubQueue};
@@ -25,16 +27,41 @@ impl IoQueueId {
     }
 }
 
-pub struct IoQueuePair<'a, A> {
+pub struct IoQueuePair<'a, A: NvmeAllocator, const SIZE: usize> {
     pub(crate) id: IoQueueId,
-    pub(crate) device: &'a NvmeDevice<A>,
-    pub(crate) namespace: &'a NvmeNamespace,
-    pub(crate) sub_queue: SubQueue,
-    pub(crate) comp_queue: CompQueue,
-    pub(crate) prp_manager: PrpManager,
+    allocator: Rc<A>,
+    namespace: &'a NvmeNamespace,
+    doorbell_helper: DoorbellHelper,
+    sub_queue: SubQueue<SIZE>,
+    comp_queue: CompQueue<SIZE>,
+    prp_manager: PrpManager,
+    max_transfer_size: u64,
 }
 
-impl<A: NvmeAllocator> IoQueuePair<'_, A> {
+impl<'a, A: NvmeAllocator, const SIZE: usize> IoQueuePair<'a, A, SIZE> {
+    pub(crate) fn new(
+        id: IoQueueId,
+        namespace: &'a NvmeNamespace,
+        doorbell_helper: DoorbellHelper,
+        sub_queue: SubQueue<SIZE>,
+        comp_queue: CompQueue<SIZE>,
+        allocator: Rc<A>,
+        max_transfer_size: u64,
+    ) -> Self {
+        Self {
+            id,
+            namespace,
+            doorbell_helper,
+            sub_queue,
+            comp_queue,
+            prp_manager: Default::default(),
+            allocator,
+            max_transfer_size,
+        }
+    }
+}
+
+impl<A: NvmeAllocator, const SIZE: usize> IoQueuePair<'_, A, SIZE> {
     fn submit_io(
         &mut self,
         blocks: u16,
@@ -46,7 +73,7 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
 
         let prp_result = self
             .prp_manager
-            .create(&self.device.allocator, address, bytes)?;
+            .create(self.allocator.as_ref(), address, bytes)?;
 
         let prp = prp_result.get_prp();
 
@@ -59,13 +86,10 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
             write,
         );
 
-        let tail = self
-            .sub_queue
-            .try_push(command)
-            .ok_or(NvmeError::QueueFull)?;
+        let tail = self.sub_queue.try_push(command)?;
 
         let doorbell = Doorbell::SubTail(*self.id);
-        self.device.write_doorbell(doorbell, tail as u32);
+        self.doorbell_helper.write(doorbell, tail as u32);
 
         Ok(prp_result)
     }
@@ -74,7 +98,7 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
         let (tail, entry) = self.comp_queue.pop_n(step as usize);
 
         let doorbell = Doorbell::CompHead(*self.id);
-        self.device.write_doorbell(doorbell, tail as u32);
+        self.doorbell_helper.write(doorbell, tail as u32);
 
         let status = (entry.status >> 1) & 0xff;
         if status != 0 {
@@ -85,7 +109,7 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
     }
 }
 
-impl<A: NvmeAllocator> IoQueuePair<'_, A> {
+impl<A: NvmeAllocator, const SIZE: usize> IoQueuePair<'_, A, SIZE> {
     fn handle_read_write(
         &mut self,
         bytes: u64,
@@ -93,7 +117,7 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
         address: usize,
         write: bool,
     ) -> Result<()> {
-        if bytes > self.device.controller_data.max_transfer_size {
+        if bytes > self.max_transfer_size {
             return Err(NvmeError::IoSizeExceedsMdts);
         }
         if bytes % self.namespace.block_size != 0 {
@@ -103,13 +127,14 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
         let blocks = (bytes / self.namespace.block_size) as u16;
         let prp_result = self.submit_io(blocks, lba, address, write)?;
         self.sub_queue.head = self.complete_io(1)? as usize;
-        self.prp_manager.release(prp_result, &self.device.allocator);
+        self.prp_manager
+            .release(prp_result, self.allocator.as_ref());
 
         Ok(())
     }
 }
 
-impl<A: NvmeAllocator> IoQueuePair<'_, A> {
+impl<A: NvmeAllocator, const SIZE: usize> IoQueuePair<'_, A, SIZE> {
     pub fn read(&mut self, dest: *mut u8, bytes: usize, lba: u64) -> Result<()> {
         self.handle_read_write(bytes as u64, lba, dest as usize, false)
     }

@@ -1,7 +1,6 @@
 use crate::error::{NvmeError, Result};
-use alloc::vec::Vec;
+use alloc::{collections::vec_deque::VecDeque, vec::Vec};
 use core::ops::{Deref, DerefMut};
-use crossbeam_queue::ArrayQueue;
 
 /// Allocates physically contiguous memory mapped into virtual address space.
 ///
@@ -23,7 +22,8 @@ pub trait NvmeAllocator {
     ///
     /// This is unsafe because:
     /// - Returns uninitialized memory
-    /// - Implementation must ensure physical contiguity and valid virtual mapping
+    /// - It must be a contiguous piece of memory at a physical address
+    /// - It must be correctly mapped to virtual memory
     unsafe fn allocate(&self, size: usize) -> usize;
 
     /// Deallocates a previously allocated region of memory.
@@ -123,11 +123,47 @@ impl PrpResult {
     }
 }
 
+/// A simple fixed-size queue.
+///
+/// This queue is used to store PRP lists for reuse.
+struct FixedSizeQueue<T> {
+    queue: VecDeque<T>,
+}
+
+impl<T> FixedSizeQueue<T> {
+    /// Creates a new `FixedSizeQueue`.
+    fn new(capacity: usize) -> Self {
+        Self {
+            queue: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    /// Checks if the queue is full.
+    fn is_full(&self) -> bool {
+        self.queue.len() == self.queue.capacity()
+    }
+
+    /// Pops an item from the queue.
+    fn pop(&mut self) -> Option<T> {
+        self.queue.pop_front()
+    }
+
+    /// Pushes an item into the queue.
+    fn push(&mut self, item: T) -> Result<()> {
+        if self.queue.len() < self.queue.capacity() {
+            self.queue.push_back(item);
+            Ok(())
+        } else {
+            Err(NvmeError::QueueFull)
+        }
+    }
+}
+
 /// Manages the creation and release of PRP results.
 ///
-/// It will cache a number of PRP lists to avoid frequent allocations and deallocations.
+/// It will cache a number of PRP lists to avoid frequent allocations.
 pub(crate) struct PrpManager {
-    list_pool: ArrayQueue<Dma<[u64; 512]>>,
+    list_pool: FixedSizeQueue<Dma<[u64; 512]>>,
 }
 
 impl Default for PrpManager {
@@ -136,7 +172,7 @@ impl Default for PrpManager {
     /// The default size is 32, which can be adjusted based on the expected workload.
     fn default() -> Self {
         Self {
-            list_pool: ArrayQueue::new(32),
+            list_pool: FixedSizeQueue::new(32),
         }
     }
 }
@@ -154,7 +190,7 @@ impl PrpManager {
     /// more than a page (currently always 4096 bytes) because the NVMe controller
     /// reads or writes data in block size which will cause unexpected memory access.
     pub(crate) fn create<A: NvmeAllocator>(
-        &self,
+        &mut self,
         allocator: &A,
         address: usize,
         bytes: usize,
@@ -210,7 +246,7 @@ impl PrpManager {
     ///
     /// If the result contains PRP lists, it will attempt to return them to the
     /// list cache pool and if the pool is full, the lists will be deallocated.
-    pub(crate) fn release<A: NvmeAllocator>(&self, prp_result: PrpResult, allocator: &A) {
+    pub(crate) fn release<A: NvmeAllocator>(&mut self, prp_result: PrpResult, allocator: &A) {
         if let PrpResult::List(_, prp_lists) = prp_result {
             for prp in prp_lists {
                 if self.list_pool.is_full() {

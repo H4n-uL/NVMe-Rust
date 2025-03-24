@@ -10,10 +10,10 @@ extern crate alloc;
 mod cmd;
 mod device;
 mod error;
-mod nvme;
 mod memory;
+mod nvme;
 mod queues;
 
-pub use device::{NvmeControllerData, NvmeDevice};
+pub use device::{NvmeControllerData, NvmeDevice, NvmeNamespace};
 pub use error::NvmeError;
 pub use memory::NvmeAllocator;

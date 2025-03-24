@@ -1,4 +1,4 @@
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 #[repr(C, packed)]
 pub(crate) struct Command {
     /// Opcode

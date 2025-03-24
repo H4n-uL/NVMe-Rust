@@ -2,7 +2,7 @@
 
 A no-std compatible NVMe driver for embedded and operating system development.
 
-## Usage
+## Example
 
 ```rust
 use alloc::boxed::Box;
@@ -39,13 +39,13 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     // You can get the block size and count of the namespace
     let _disk_size = namespace.block_count * namespace.block_size;
 
-    // Create a io queue pair to perform IO operations
-    let mut qpair = controller.create_io_queue_pair(namespace, 64)?;
+    // Create a I/O queue pair to perform IO operations
+    let mut qpair = controller.create_io_queue_pair::<64>(namespace)?;
 
     // Should not be larger than controller.controller_data.max_transfer_size
     const TEST_LENGTH: usize = 524288;
 
-    // Create a 4096 byte-aligned read buffer
+    // Create a 4096 byte aligned read buffer
     let layout = Layout::from_size_align(TEST_LENGTH, 4096)?;
     let read_buffer_ptr = unsafe { ALLOCATOR.alloc(layout) };
     let read_buffer = unsafe { core::slice::from_raw_parts_mut(read_buffer_ptr, TEST_LENGTH) };
@@ -53,7 +53,7 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     // Read `TEST_LENGTH` bytes starting from LBA 34
     qpair.read(read_buffer.as_mut_ptr(), read_buffer.len(), 34)?;
 
-    // Create a 4096 byte-aligned write buffer
+    // Create a 4096 byte aligned write buffer
     let write_buffer_ptr = unsafe { ALLOCATOR.alloc(layout) };
     let write_buffer = unsafe { core::slice::from_raw_parts_mut(write_buffer_ptr, TEST_LENGTH) };
 
@@ -75,6 +75,9 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
             break;
         }
     }
+
+    // Delete the I/O queue pair to release resources
+    controller.delete_io_queue_pair(qpair)?;
 
     Ok(())
 }
