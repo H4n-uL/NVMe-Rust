@@ -21,6 +21,12 @@ pub enum NvmeError {
     /// The transfer size limit can be found in the `NvmeControllerData`.
     IoSizeExceedsMdts,
 
+    /// The queue size is less than 2.
+    QueueSizeTooSmall,
+
+    /// The queue size exceeds the maximum queue entry size (MQES).
+    QueueSizeExceedsMqes,
+
     /// Command failed with a specific status code.
     CommandFailed(u16),
 }
@@ -43,7 +49,13 @@ impl Display for NvmeError {
                 write!(f, "Target address must be aligned to minimum page size")
             }
             NvmeError::IoSizeExceedsMdts => {
-                write!(f, "Single IO size should be less than MDTS")
+                write!(f, "Single IO size exceeds maximum data transfer size")
+            }
+            NvmeError::QueueSizeTooSmall => {
+                write!(f, "The queue size is less than 2")
+            }
+            NvmeError::QueueSizeExceedsMqes => {
+                write!(f, "The queue size exceeds the maximum queue entry size")
             }
             NvmeError::CommandFailed(code) => {
                 write!(f, "Command failed with status code: {}", code)

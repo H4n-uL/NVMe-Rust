@@ -1,6 +1,7 @@
 use crate::error::{NvmeError, Result};
 use alloc::{collections::vec_deque::VecDeque, vec::Vec};
 use core::ops::{Deref, DerefMut};
+use core::slice::{from_raw_parts, from_raw_parts_mut};
 
 /// Allocates physically contiguous memory mapped into virtual address space.
 ///
@@ -47,17 +48,18 @@ pub trait NvmeAllocator {
 pub(crate) struct Dma<T> {
     pub addr: *mut T,
     pub phys_addr: usize,
+    count: usize,
 }
 
 impl<T> Deref for Dma<T> {
-    type Target = T;
+    type Target = [T];
 
     /// Dereferences the DMA buffer to access the underlying value.
     ///
     /// # Safety
     /// This method assumes that the pointer is valid and properly aligned.
     fn deref(&self) -> &Self::Target {
-        unsafe { &*self.addr }
+        unsafe { from_raw_parts(self.addr, self.count) }
     }
 }
 
@@ -67,7 +69,7 @@ impl<T> DerefMut for Dma<T> {
     /// # Safety
     /// This method assumes that the pointer is valid and properly aligned.
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.addr }
+        unsafe { from_raw_parts_mut(self.addr, self.count) }
     }
 }
 
@@ -76,15 +78,16 @@ impl<T> Dma<T> {
     ///
     /// The allocated memory is page-aligned and sized to fit the type T,
     /// rounded up to the nearest page boundary.
-    pub fn allocate<A: NvmeAllocator>(allocator: &A) -> Dma<T> {
-        let addr = unsafe {
-            let size = core::mem::size_of::<T>();
-            allocator.allocate(size.div_ceil(4096) * 4096)
-        } as *mut T;
+    pub fn allocate<A: NvmeAllocator>(count: usize, allocator: &A) -> Dma<T> {
+        let size = core::mem::size_of::<T>() * count;
+        let aligned = size.div_ceil(4096) * 4096;
+        let addr = unsafe { allocator.allocate(aligned) };
 
-        let phys_addr = allocator.translate(addr as usize);
-
-        Self { addr, phys_addr }
+        Self {
+            addr: addr as *mut T,
+            phys_addr: allocator.translate(addr),
+            count,
+        }
     }
 
     /// Deallocates the DMA buffer using the provided allocator.
@@ -107,7 +110,7 @@ pub(crate) enum PrpResult {
     /// Addresses of PRP1 and PRP2
     Double(usize, usize),
     /// Address of PRP1 and a list of PRP2s
-    List(usize, Vec<Dma<[u64; 512]>>),
+    List(usize, Vec<Dma<u64>>),
 }
 
 impl PrpResult {
@@ -163,7 +166,7 @@ impl<T> FixedSizeQueue<T> {
 ///
 /// It will cache a number of PRP lists to avoid frequent allocations.
 pub(crate) struct PrpManager {
-    list_pool: FixedSizeQueue<Dma<[u64; 512]>>,
+    list_pool: FixedSizeQueue<Dma<u64>>,
 }
 
 impl Default for PrpManager {
@@ -226,7 +229,7 @@ impl PrpManager {
             let mut prp_list = self
                 .list_pool
                 .pop()
-                .unwrap_or_else(|| Dma::allocate(allocator));
+                .unwrap_or_else(|| Dma::allocate(512, allocator));
             for i in 0..entries {
                 prp_list[i] = (prp2_start + (list_idx * 511 + i) * 4096) as u64;
             }

@@ -16,32 +16,6 @@ pub(crate) struct Completion {
     pub status: u16,
 }
 
-/// Maximum length of a NVMe queue.
-///
-/// Here we choose 4096, which is the maximum length of a admin
-/// queue for simplification (I/O queue can be 65536 at most).
-pub const MAX_QUEUE_LENGTH: usize = 4096;
-
-/// Macro to assert the size of the queue.
-///
-/// This macro checks if the size of the queue is
-/// smaller than 2 or larger than the maximum queue length
-/// and panic if the size is invalid.
-macro_rules! assert_size {
-    ($name:ident) => {
-        struct Assert<const N: usize>;
-        impl<const N: usize> Assert<N> {
-            const ASSERT_MIN: () = assert!(N >= 2, "queue size cannot be smaller than 2");
-            const ASSERT_MAX: () = assert!(
-                N <= MAX_QUEUE_LENGTH,
-                "queue size cannot be larger than MAX_QUEUE_LENGTH(4096)"
-            );
-        }
-        _ = Assert::<$name>::ASSERT_MAX;
-        _ = Assert::<$name>::ASSERT_MIN;
-    };
-}
-
 /// Represents an NVMe submission queue.
 ///
 /// The submission queue holds commands that are
@@ -55,25 +29,27 @@ macro_rules! assert_size {
 ///
 /// Notice that the DMA allocation is fit to page size, so the
 /// actual minimum size of the submission queue is 64 (4096 bytes).
-pub(crate) struct SubQueue<const SIZE: usize> {
+pub(crate) struct SubQueue {
     /// The command slots
-    slots: Dma<[Command; SIZE]>,
+    slots: Dma<Command>,
     /// Current head position of the queue
     pub head: usize,
     /// Current tail position of the queue
     pub tail: usize,
+    /// Length of the queue
+    len: usize,
 }
 
-impl<const SIZE: usize> SubQueue<SIZE> {
+impl SubQueue {
     /// Creates a new submission queue.
     ///
     /// The allocator should implement the `NvmeAllocator` trait.
-    pub fn new<A: NvmeAllocator>(allocator: &A) -> Self {
-        assert_size!(SIZE);
+    pub fn new<A: NvmeAllocator>(len: usize, allocator: &A) -> Self {
         Self {
-            slots: Dma::allocate(allocator),
+            slots: Dma::allocate(len, allocator),
             head: 0,
             tail: 0,
+            len,
         }
     }
 
@@ -100,11 +76,11 @@ impl<const SIZE: usize> SubQueue<SIZE> {
     ///
     /// It does not block if the queue is full.
     pub fn try_push(&mut self, entry: Command) -> Result<usize> {
-        if self.head == (self.tail + 1) % SIZE {
+        if self.head == (self.tail + 1) % self.len {
             Err(NvmeError::QueueFull)
         } else {
             self.slots[self.tail] = entry;
-            self.tail = (self.tail + 1) % SIZE;
+            self.tail = (self.tail + 1) % self.len;
             Ok(self.tail)
         }
     }
@@ -125,25 +101,27 @@ impl<const SIZE: usize> SubQueue<SIZE> {
 /// actual minimum size of the completion queue is 256 (4096 bytes).
 /// However, the size of the completion queue should be same as
 /// the submission queue, so the minimum size is 64 either.
-pub(crate) struct CompQueue<const SIZE: usize> {
+pub(crate) struct CompQueue {
     /// The completion slots
-    slots: Dma<[Completion; SIZE]>,
+    slots: Dma<Completion>,
     /// Current head position of the queue
     head: usize,
     /// Used to determine if an entry is valid
     phase: bool,
+    /// Length of the queue
+    len: usize,
 }
 
-impl<const SIZE: usize> CompQueue<SIZE> {
+impl CompQueue {
     /// Creates a new completion queue.
     ///
     /// The allocator should implement the `NvmeAllocator` trait.
-    pub fn new<A: NvmeAllocator>(allocator: &A) -> Self {
-        assert_size!(SIZE);
+    pub fn new<A: NvmeAllocator>(len: usize, allocator: &A) -> Self {
         Self {
-            slots: Dma::allocate(allocator),
+            slots: Dma::allocate(len, allocator),
             head: 0,
             phase: true,
+            len,
         }
     }
 
@@ -171,10 +149,10 @@ impl<const SIZE: usize> CompQueue<SIZE> {
     /// It returns the final head position and the completion entry.
     pub fn pop_n(&mut self, step: usize) -> (usize, Completion) {
         self.head += step - 1;
-        if self.head >= SIZE {
+        if self.head >= self.len {
             self.phase = !self.phase;
         }
-        self.head %= SIZE;
+        self.head %= self.len;
         self.pop()
     }
 
@@ -187,7 +165,7 @@ impl<const SIZE: usize> CompQueue<SIZE> {
         let entry = &self.slots[self.head];
 
         (((entry.status & 1) == 1) == self.phase).then(|| {
-            self.head = (self.head + 1) % SIZE;
+            self.head = (self.head + 1) % self.len;
             if self.head == 0 {
                 self.phase = !self.phase;
             }

@@ -27,24 +27,24 @@ impl IoQueueId {
     }
 }
 
-pub struct IoQueuePair<'a, A: NvmeAllocator, const SIZE: usize> {
+pub struct IoQueuePair<'a, A: NvmeAllocator> {
     pub(crate) id: IoQueueId,
     allocator: Rc<A>,
     namespace: &'a NvmeNamespace,
     doorbell_helper: DoorbellHelper,
-    sub_queue: SubQueue<SIZE>,
-    comp_queue: CompQueue<SIZE>,
+    sub_queue: SubQueue,
+    comp_queue: CompQueue,
     prp_manager: PrpManager,
     max_transfer_size: u64,
 }
 
-impl<'a, A: NvmeAllocator, const SIZE: usize> IoQueuePair<'a, A, SIZE> {
+impl<'a, A: NvmeAllocator> IoQueuePair<'a, A> {
     pub(crate) fn new(
         id: IoQueueId,
         namespace: &'a NvmeNamespace,
         doorbell_helper: DoorbellHelper,
-        sub_queue: SubQueue<SIZE>,
-        comp_queue: CompQueue<SIZE>,
+        sub_queue: SubQueue,
+        comp_queue: CompQueue,
         allocator: Rc<A>,
         max_transfer_size: u64,
     ) -> Self {
@@ -61,7 +61,7 @@ impl<'a, A: NvmeAllocator, const SIZE: usize> IoQueuePair<'a, A, SIZE> {
     }
 }
 
-impl<A: NvmeAllocator, const SIZE: usize> IoQueuePair<'_, A, SIZE> {
+impl<A: NvmeAllocator> IoQueuePair<'_, A> {
     fn submit_io(
         &mut self,
         blocks: u16,
@@ -109,7 +109,7 @@ impl<A: NvmeAllocator, const SIZE: usize> IoQueuePair<'_, A, SIZE> {
     }
 }
 
-impl<A: NvmeAllocator, const SIZE: usize> IoQueuePair<'_, A, SIZE> {
+impl<A: NvmeAllocator> IoQueuePair<'_, A> {
     fn handle_read_write(
         &mut self,
         bytes: u64,
@@ -134,7 +134,7 @@ impl<A: NvmeAllocator, const SIZE: usize> IoQueuePair<'_, A, SIZE> {
     }
 }
 
-impl<A: NvmeAllocator, const SIZE: usize> IoQueuePair<'_, A, SIZE> {
+impl<A: NvmeAllocator> IoQueuePair<'_, A> {
     pub fn read(&mut self, dest: *mut u8, bytes: usize, lba: u64) -> Result<()> {
         self.handle_read_write(bytes as u64, lba, dest as usize, false)
     }
