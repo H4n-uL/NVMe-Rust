@@ -4,16 +4,18 @@
 //! (Non-Volatile Memory Express) storage devices in environments without
 //! the standard library, such as kernels, bootloaders, or embedded systems.
 #![no_std]
+#![deny(missing_docs)]
 
 extern crate alloc;
 
 mod cmd;
 mod device;
 mod error;
+mod io;
 mod memory;
-mod nvme;
 mod queues;
 
-pub use device::{NvmeControllerData, NvmeDevice, NvmeNamespace};
-pub use error::NvmeError;
-pub use memory::NvmeAllocator;
+pub use device::{ControllerData, Device, Namespace};
+pub use error::Error;
+pub use io::IoQueuePair;
+pub use memory::Allocator;

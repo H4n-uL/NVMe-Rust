@@ -1,4 +1,4 @@
-use crate::error::{NvmeError, Result};
+use crate::error::{Error, Result};
 use alloc::{collections::vec_deque::VecDeque, vec::Vec};
 use core::ops::{Deref, DerefMut};
 use core::slice::{from_raw_parts, from_raw_parts_mut};
@@ -6,7 +6,7 @@ use core::slice::{from_raw_parts, from_raw_parts_mut};
 /// Allocates physically contiguous memory mapped into virtual address space.
 ///
 /// Used for DMA operations requiring contiguous physical memory.
-pub trait NvmeAllocator {
+pub trait Allocator {
     /// Translates a virtual address to a physical address.
     ///
     /// You may want to use your page table to translate the address
@@ -78,7 +78,7 @@ impl<T> Dma<T> {
     ///
     /// The allocated memory is page-aligned and sized to fit the type T,
     /// rounded up to the nearest page boundary.
-    pub fn allocate<A: NvmeAllocator>(count: usize, allocator: &A) -> Dma<T> {
+    pub fn allocate<A: Allocator>(count: usize, allocator: &A) -> Dma<T> {
         let size = core::mem::size_of::<T>() * count;
         let aligned = size.div_ceil(4096) * 4096;
         let addr = unsafe { allocator.allocate(aligned) };
@@ -96,7 +96,7 @@ impl<T> Dma<T> {
     ///
     /// This method assumes that the memory was allocated using the same allocator.
     /// After calling this method, the Dma instance should not be used anymore.
-    pub fn deallocate<A: NvmeAllocator>(&self, allocator: &A) {
+    pub fn deallocate<A: Allocator>(&self, allocator: &A) {
         unsafe {
             allocator.deallocate(self.addr as usize);
         }
@@ -152,13 +152,8 @@ impl<T> FixedSizeQueue<T> {
     }
 
     /// Pushes an item into the queue.
-    fn push(&mut self, item: T) -> Result<()> {
-        if self.queue.len() < self.queue.capacity() {
-            self.queue.push_back(item);
-            Ok(())
-        } else {
-            Err(NvmeError::QueueFull)
-        }
+    fn push(&mut self, item: T) {
+        self.queue.push_back(item);
     }
 }
 
@@ -192,7 +187,7 @@ impl PrpManager {
     /// And it must be aligned to a page boundary if read or write
     /// more than a page (currently always 4096 bytes) because the NVMe controller
     /// reads or writes data in block size which will cause unexpected memory access.
-    pub(crate) fn create<A: NvmeAllocator>(
+    pub(crate) fn create<A: Allocator>(
         &mut self,
         allocator: &A,
         address: usize,
@@ -204,13 +199,13 @@ impl PrpManager {
         let prp2_start = allocator.translate(address + 4096);
 
         if (address & 0x3) != 0 {
-            return Err(NvmeError::NotAlignedToDword);
+            return Err(Error::NotAlignedToDword);
         }
         if count == 1 {
             return Ok(PrpResult::Single(prp1));
         }
         if (address & 0xfff) != 0 {
-            return Err(NvmeError::NotAlignedToPage);
+            return Err(Error::NotAlignedToPage);
         }
         if count == 2 {
             return Ok(PrpResult::Double(prp1, prp2_start));
@@ -247,15 +242,15 @@ impl PrpManager {
     ///
     /// All PRP results created by this manager should be released using this method.
     ///
-    /// If the result contains PRP lists, it will attempt to return them to the
+    /// If the result contains PRP lists, it will attempt to transfer them to the
     /// list cache pool and if the pool is full, the lists will be deallocated.
-    pub(crate) fn release<A: NvmeAllocator>(&mut self, prp_result: PrpResult, allocator: &A) {
+    pub(crate) fn release<A: Allocator>(&mut self, prp_result: PrpResult, allocator: &A) {
         if let PrpResult::List(_, prp_lists) = prp_result {
             for prp in prp_lists {
                 if self.list_pool.is_full() {
                     prp.deallocate(allocator);
                 } else {
-                    let _ = self.list_pool.push(prp);
+                    self.list_pool.push(prp);
                 }
             }
         }

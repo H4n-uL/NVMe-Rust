@@ -1,63 +1,53 @@
-use core::error::Error;
 use core::fmt::{self, Display};
 
 /// Contains all possible errors that can occur in the NVMe driver.
 #[derive(Debug)]
-pub enum NvmeError {
+pub enum Error {
     /// The submission queue is full.
-    QueueFull,
-
+    SubQueueFull,
     /// Buffer size must be a multiple of the block size.
     InvalidBufferSize,
-
     /// Target address must be aligned to dword.
     NotAlignedToDword,
-
     /// Target address must be aligned to minimum page size.
     NotAlignedToPage,
-
     /// Single IO size should be less than maximum data transfer size (MDTS).
-    ///
-    /// The transfer size limit can be found in the `NvmeControllerData`.
     IoSizeExceedsMdts,
-
     /// The queue size is less than 2.
     QueueSizeTooSmall,
-
     /// The queue size exceeds the maximum queue entry size (MQES).
     QueueSizeExceedsMqes,
-
     /// Command failed with a specific status code.
     CommandFailed(u16),
 }
 
-impl Error for NvmeError {}
+impl core::error::Error for Error {}
 
-impl Display for NvmeError {
+impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NvmeError::QueueFull => {
+            Error::SubQueueFull => {
                 write!(f, "The submission queue is full")
             }
-            NvmeError::InvalidBufferSize => {
+            Error::InvalidBufferSize => {
                 write!(f, "Buffer size must be a multiple of the block size.")
             }
-            NvmeError::NotAlignedToDword => {
+            Error::NotAlignedToDword => {
                 write!(f, "Target address must be aligned to dword")
             }
-            NvmeError::NotAlignedToPage => {
+            Error::NotAlignedToPage => {
                 write!(f, "Target address must be aligned to minimum page size")
             }
-            NvmeError::IoSizeExceedsMdts => {
+            Error::IoSizeExceedsMdts => {
                 write!(f, "Single IO size exceeds maximum data transfer size")
             }
-            NvmeError::QueueSizeTooSmall => {
+            Error::QueueSizeTooSmall => {
                 write!(f, "The queue size is less than 2")
             }
-            NvmeError::QueueSizeExceedsMqes => {
+            Error::QueueSizeExceedsMqes => {
                 write!(f, "The queue size exceeds the maximum queue entry size")
             }
-            NvmeError::CommandFailed(code) => {
+            Error::CommandFailed(code) => {
                 write!(f, "Command failed with status code: {}", code)
             }
         }
@@ -65,4 +55,4 @@ impl Display for NvmeError {
 }
 
 /// Result type for NVMe operations.
-pub type Result<T> = core::result::Result<T, NvmeError>;
+pub type Result<T> = core::result::Result<T, Error>;

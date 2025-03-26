@@ -1,8 +1,8 @@
 use core::hint::spin_loop;
 
 use crate::cmd::Command;
-use crate::error::{NvmeError, Result};
-use crate::memory::{Dma, NvmeAllocator};
+use crate::error::{Error, Result};
+use crate::memory::{Dma, Allocator};
 
 /// Completion entry in the NVMe completion queue.
 #[derive(Debug, Clone)]
@@ -20,15 +20,6 @@ pub(crate) struct Completion {
 ///
 /// The submission queue holds commands that are
 /// waiting to be processed by the NVMe controller.
-///
-/// # Const Generics
-///
-/// The `SIZE` parameter is a const generic that specifies the size
-/// of the queue. It must be between 2 and `MAX_QUEUE_LENGTH(4096)`.
-/// It will panic at compile time if the size is invalid.
-///
-/// Notice that the DMA allocation is fit to page size, so the
-/// actual minimum size of the submission queue is 64 (4096 bytes).
 pub(crate) struct SubQueue {
     /// The command slots
     slots: Dma<Command>,
@@ -43,8 +34,8 @@ pub(crate) struct SubQueue {
 impl SubQueue {
     /// Creates a new submission queue.
     ///
-    /// The allocator should implement the `NvmeAllocator` trait.
-    pub fn new<A: NvmeAllocator>(len: usize, allocator: &A) -> Self {
+    /// The allocator should implement the `Allocator` trait.
+    pub fn new<A: Allocator>(len: usize, allocator: &A) -> Self {
         Self {
             slots: Dma::allocate(len, allocator),
             head: 0,
@@ -77,7 +68,7 @@ impl SubQueue {
     /// It does not block if the queue is full.
     pub fn try_push(&mut self, entry: Command) -> Result<usize> {
         if self.head == (self.tail + 1) % self.len {
-            Err(NvmeError::QueueFull)
+            Err(Error::SubQueueFull)
         } else {
             self.slots[self.tail] = entry;
             self.tail = (self.tail + 1) % self.len;
@@ -90,17 +81,6 @@ impl SubQueue {
 ///
 /// The completion queue holds completion entries that indicate the
 /// status of processed commands from the submission queue.
-///
-/// # Const Generics
-///
-/// The `SIZE` parameter is a const generic that specifies the size
-/// of the queue. It must be between 2 and `MAX_QUEUE_LENGTH(4096)`.
-/// It will panic at compile time if the size is invalid.
-///
-/// Notice that the DMA allocation is fit to page size, so the
-/// actual minimum size of the completion queue is 256 (4096 bytes).
-/// However, the size of the completion queue should be same as
-/// the submission queue, so the minimum size is 64 either.
 pub(crate) struct CompQueue {
     /// The completion slots
     slots: Dma<Completion>,
@@ -115,8 +95,8 @@ pub(crate) struct CompQueue {
 impl CompQueue {
     /// Creates a new completion queue.
     ///
-    /// The allocator should implement the `NvmeAllocator` trait.
-    pub fn new<A: NvmeAllocator>(len: usize, allocator: &A) -> Self {
+    /// The allocator should implement the `Allocator` trait.
+    pub fn new<A: Allocator>(len: usize, allocator: &A) -> Self {
         Self {
             slots: Dma::allocate(len, allocator),
             head: 0,

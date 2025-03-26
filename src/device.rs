@@ -4,9 +4,9 @@ use alloc::vec::Vec;
 use core::hint::spin_loop;
 
 use crate::cmd::{Command, IdentifyType};
-use crate::error::{NvmeError, Result};
-use crate::memory::{Dma, NvmeAllocator};
-use crate::nvme::{IoQueueId, IoQueuePair};
+use crate::error::{Error, Result};
+use crate::io::{IoQueueId, IoQueuePair};
+use crate::memory::{Dma, Allocator};
 use crate::queues::{CompQueue, Completion, SubQueue};
 
 /// Default size of an admin queue.
@@ -97,7 +97,7 @@ struct NamespaceData {
 /// Some from the CAP register and some from the
 /// identified controller data structure.
 #[derive(Default, Debug, Clone)]
-pub struct NvmeControllerData {
+pub struct ControllerData {
     /// Serial number
     pub serial_number: String,
     /// Model number
@@ -114,35 +114,51 @@ pub struct NvmeControllerData {
 
 /// A structure representing an NVMe namespace.
 #[derive(Debug, Clone)]
-pub struct NvmeNamespace {
-    /// Namespace ID
-    pub id: u32,
-    /// Block count
-    pub block_count: u64,
-    /// Block size (in bytes)
-    pub block_size: u64,
+pub struct Namespace {
+    id: u32,
+    block_count: u64,
+    block_size: u64,
+}
+
+impl Namespace {
+    /// Get the namespace ID.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Get the block count.
+    pub fn block_count(&self) -> u64 {
+        self.block_count
+    }
+
+    /// Get the block size (in bytes).
+    pub fn block_size(&self) -> u64 {
+        self.block_size
+    }
 }
 
 /// A structure representing an NVMe controller device.
-pub struct NvmeDevice<A> {
+pub struct Device<A> {
     address: *mut u8,
     pub(crate) allocator: Rc<A>,
     pub(crate) admin_sq: SubQueue,
     admin_cq: CompQueue,
     admin_buffer: Dma<u8>,
     doorbell_helper: DoorbellHelper,
-    /// Some useful information of the controller
-    pub data: NvmeControllerData,
+    data: ControllerData,
 }
 
-unsafe impl<A> Send for NvmeDevice<A> {}
-unsafe impl<A> Sync for NvmeDevice<A> {}
+unsafe impl<A> Send for Device<A> {}
+unsafe impl<A> Sync for Device<A> {}
 
-impl<A: NvmeAllocator> NvmeDevice<A> {
+impl<A: Allocator> Device<A> {
     /// Initialize a NVMe controller device.
     ///
-    /// The `address` is the base address of the controller and the
-    /// `allocator` is the global DMA allocator for the entire NVMe device.
+    /// The `address` is the base address of the controller
+    /// constructed by the PCI BAR 0 (lower 32 bits) and BAR 1 (upper 32 bits).
+    ///
+    /// The `allocator` is a DMA allocator that implements
+    /// the `Allocator` trait used for the entire NVMe device.
     pub fn init(address: usize, allocator: A) -> Result<Self> {
         let mut device = Self {
             address: address as _,
@@ -199,14 +215,31 @@ impl<A: NvmeAllocator> NvmeDevice<A> {
 
         let max_pages = 1 << device.admin_buffer.as_ref()[77];
         device.data.max_transfer_size = max_pages as u64 * device.data.min_pagesize as u64;
-        device.data.max_transfer_size = device.data.max_transfer_size.min(0xFFFF_FFFF);
 
         Ok(device)
     }
 }
 
-impl<A: NvmeAllocator> NvmeDevice<A> {
-    pub fn identify_namespaces(&mut self, base: u32) -> Result<Vec<NvmeNamespace>> {
+impl<A: Allocator> Device<A> {
+    /// Get a reference to the NVMe controller data.
+    ///
+    /// Almost all useful information about the controller
+    /// can be found in this structure.
+    ///
+    /// Note that disk and block size are namespace attributes,
+    /// and you should be getting them via `identify_namespaces` function.
+    pub fn controller_data(&self) -> &ControllerData {
+        &self.data
+    }
+}
+
+impl<A: Allocator> Device<A> {
+    /// Identify all namespaces on the NVMe device.
+    ///
+    /// This function will return a vector of `Namespace` structures
+    /// that contain information about each namespace which is supposed to
+    /// be seen as a separate disk.
+    pub fn identify_namespaces(&mut self, base: u32) -> Result<Vec<Namespace>> {
         self.exec_admin(Command::identify(
             self.admin_sq.tail as u16,
             self.admin_buffer.phys_addr,
@@ -231,7 +264,7 @@ impl<A: NvmeAllocator> NvmeDevice<A> {
             let flba_index = (data.lba_size & 0xF) as usize;
             let flba_data = (data.lba_format_support[flba_index] >> 16) & 0xFF;
 
-            Ok(NvmeNamespace {
+            Ok(Namespace {
                 id,
                 block_size: 1 << flba_data,
                 block_count: data.capacity,
@@ -242,7 +275,7 @@ impl<A: NvmeAllocator> NvmeDevice<A> {
     }
 }
 
-impl<A: NvmeAllocator> NvmeDevice<A> {
+impl<A: Allocator> Device<A> {
     /// Helper function to read a NVMe register.
     fn get_reg<T>(&self, reg: Register) -> T {
         let address = self.address as usize + reg as usize;
@@ -267,24 +300,39 @@ impl<A: NvmeAllocator> NvmeDevice<A> {
 
         let status = (entry.status >> 1) & 0xff;
         if status != 0 {
-            return Err(NvmeError::CommandFailed(status));
+            return Err(Error::CommandFailed(status));
         }
 
         Ok(entry)
     }
 }
 
-impl<A: NvmeAllocator> NvmeDevice<A> {
+impl<A: Allocator> Device<A> {
+    /// Create an I/O queue pair for a given namespace.
+    ///
+    /// This function will create a submission queue and a completion queue
+    /// for the given namespace and return an `IoQueuePair` structure.
+    /// The `len` parameter specifies the number of entries in the queue.
+    /// The minimum size is 2 and the maximum size is limited by the
+    /// `max_queue_entries` field in the controller data.
+    ///
+    /// All your I/O operations should be done through this queue pair, and
+    /// you can create multiple queue pairs if needed (e.g. per thread).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue size is less than 2 or exceeds the
+    /// maximum number of queue entries.
     pub fn create_io_queue_pair<'a>(
         &mut self,
-        namespace: &'a NvmeNamespace,
+        namespace: &'a Namespace,
         len: usize,
     ) -> Result<IoQueuePair<'a, A>> {
         if len < 2 {
-            return Err(NvmeError::QueueSizeTooSmall);
+            return Err(Error::QueueSizeTooSmall);
         }
         if len > self.data.max_queue_entries as usize {
-            return Err(NvmeError::QueueSizeExceedsMqes);
+            return Err(Error::QueueSizeExceedsMqes);
         }
 
         let queue_id = IoQueueId::new();
@@ -317,6 +365,11 @@ impl<A: NvmeAllocator> NvmeDevice<A> {
         ))
     }
 
+    /// Delete an I/O queue pair.
+    ///
+    /// This function will delete the submission queue and completion queue
+    /// associated with the given `IoQueuePair`. It will also free the resources
+    /// allocated for the queues.
     pub fn delete_io_queue_pair(&mut self, qpair: IoQueuePair<A>) -> Result<()> {
         let cmd_id = self.admin_sq.tail as u16;
         let command = Command::delete_submission_queue(cmd_id, *qpair.id);

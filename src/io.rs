@@ -4,13 +4,17 @@ use core::sync::atomic::{AtomicU16, Ordering};
 use alloc::rc::Rc;
 
 use crate::cmd::Command;
-use crate::device::{Doorbell, DoorbellHelper, NvmeNamespace};
-use crate::error::{NvmeError, Result};
-use crate::memory::{NvmeAllocator, PrpManager, PrpResult};
+use crate::device::{Doorbell, DoorbellHelper, Namespace};
+use crate::error::{Error, Result};
+use crate::memory::{Allocator, PrpManager, PrpResult};
 use crate::queues::{CompQueue, SubQueue};
 
+/// A unique identifier for an I/O queue.
+///
+/// It self-increments starting from 1 because 0
+/// is reserved for the admin queue pair.
 #[derive(Debug, Clone)]
-pub struct IoQueueId(pub u16);
+pub struct IoQueueId(u16);
 
 impl Deref for IoQueueId {
     type Target = u16;
@@ -27,10 +31,13 @@ impl IoQueueId {
     }
 }
 
-pub struct IoQueuePair<'a, A: NvmeAllocator> {
+/// A queue pair for handling NVMe I/O operations.
+///
+/// All your I/O operations should be done through this queue pair.
+pub struct IoQueuePair<'a, A: Allocator> {
     pub(crate) id: IoQueueId,
     allocator: Rc<A>,
-    namespace: &'a NvmeNamespace,
+    namespace: &'a Namespace,
     doorbell_helper: DoorbellHelper,
     sub_queue: SubQueue,
     comp_queue: CompQueue,
@@ -38,10 +45,10 @@ pub struct IoQueuePair<'a, A: NvmeAllocator> {
     max_transfer_size: u64,
 }
 
-impl<'a, A: NvmeAllocator> IoQueuePair<'a, A> {
+impl<'a, A: Allocator> IoQueuePair<'a, A> {
     pub(crate) fn new(
         id: IoQueueId,
-        namespace: &'a NvmeNamespace,
+        namespace: &'a Namespace,
         doorbell_helper: DoorbellHelper,
         sub_queue: SubQueue,
         comp_queue: CompQueue,
@@ -61,7 +68,7 @@ impl<'a, A: NvmeAllocator> IoQueuePair<'a, A> {
     }
 }
 
-impl<A: NvmeAllocator> IoQueuePair<'_, A> {
+impl<A: Allocator> IoQueuePair<'_, A> {
     fn submit_io(
         &mut self,
         blocks: u16,
@@ -69,7 +76,8 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
         address: usize,
         write: bool,
     ) -> Result<PrpResult> {
-        let bytes = blocks as usize * 512;
+        let block_size = self.namespace.block_size();
+        let bytes = (blocks as u64 * block_size) as usize;
 
         let prp_result = self
             .prp_manager
@@ -79,7 +87,7 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
 
         let command = Command::read_write(
             *self.id << 10 | self.sub_queue.tail as u16,
-            self.namespace.id,
+            self.namespace.id(),
             lba,
             blocks - 1,
             [prp.0 as u64, prp.1 as u64],
@@ -102,14 +110,14 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
 
         let status = (entry.status >> 1) & 0xff;
         if status != 0 {
-            return Err(NvmeError::CommandFailed(status));
+            return Err(Error::CommandFailed(status));
         }
 
         Ok(entry.sq_head)
     }
 }
 
-impl<A: NvmeAllocator> IoQueuePair<'_, A> {
+impl<A: Allocator> IoQueuePair<'_, A> {
     fn handle_read_write(
         &mut self,
         bytes: u64,
@@ -118,13 +126,13 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
         write: bool,
     ) -> Result<()> {
         if bytes > self.max_transfer_size {
-            return Err(NvmeError::IoSizeExceedsMdts);
+            return Err(Error::IoSizeExceedsMdts);
         }
-        if bytes % self.namespace.block_size != 0 {
-            return Err(NvmeError::InvalidBufferSize);
+        if bytes % self.namespace.block_size() != 0 {
+            return Err(Error::InvalidBufferSize);
         }
 
-        let blocks = (bytes / self.namespace.block_size) as u16;
+        let blocks = (bytes / self.namespace.block_size()) as u16;
         let prp_result = self.submit_io(blocks, lba, address, write)?;
         self.sub_queue.head = self.complete_io(1)? as usize;
         self.prp_manager
@@ -134,11 +142,17 @@ impl<A: NvmeAllocator> IoQueuePair<'_, A> {
     }
 }
 
-impl<A: NvmeAllocator> IoQueuePair<'_, A> {
+impl<A: Allocator> IoQueuePair<'_, A> {
+    /// Reads bytes from given LBA to the destination address.
+    ///
+    /// This function will block and the queue depth is always 1.
     pub fn read(&mut self, dest: *mut u8, bytes: usize, lba: u64) -> Result<()> {
         self.handle_read_write(bytes as u64, lba, dest as usize, false)
     }
 
+    /// Writes bytes from the source address to the given LBA.
+    ///
+    /// This function will block and the queue depth is always 1.
     pub fn write(&mut self, src: *const u8, bytes: usize, lba: u64) -> Result<()> {
         self.handle_read_write(bytes as u64, lba, src as usize, true)
     }

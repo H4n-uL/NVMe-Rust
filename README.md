@@ -2,17 +2,14 @@
 
 A no-std compatible NVMe driver for embedded and operating system development.
 
-## Example
+## Usage
+
+You need create a allocator that implements the `NvmeAllocator` trait.
 
 ```rust
-use alloc::boxed::Box;
-use alloc::alloc::Layout;
-use core::alloc::GlobalAlloc;
-use nvme::{NvmeAllocator, NvmeDevice};
+pub struct NvmeAllocator;
 
-pub struct Allocator;
-
-impl NvmeAllocator for Allocator {
+impl Allocator for NvmeAllocator {
     unsafe fn allocate(&self, size: usize) -> usize {
         DmaManager::allocate(size)
     }
@@ -25,13 +22,17 @@ impl NvmeAllocator for Allocator {
         DmaManager::translate_addr(addr)
     }
 }
+```
 
+Here is a complete example of a full routine that initializes the NVMe controller, identifies namespaces, and performs read/write operations.
+
+```rust
 pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     // Init the NVMe controller
-    let controller = NvmeDevice::init(virtual_address, Allocator)?;
+    let controller = Device::init(virtual_address, Allocator)?;
 
     // Some useful data you may want to see
-    let _controller_data = &controller.data;
+    let _controller_data = controller.controller_data();
 
     // Identify all namespaces (base 0)
     let namespaces = controller.identify_namespaces(0)?;
@@ -45,7 +46,7 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     // Create a I/O queue pair to perform IO operations
     let mut qpair = controller.create_io_queue_pair(namespacem, 64)?;
 
-    // Should not be larger than controller.data.max_transfer_size
+    // Should not be larger than controller_data.max_transfer_size
     const TEST_LENGTH: usize = 524288;
 
     // Create a 4096 byte aligned read buffer
