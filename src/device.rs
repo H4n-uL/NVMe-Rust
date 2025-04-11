@@ -1,4 +1,4 @@
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::hint::spin_loop;
@@ -105,7 +105,7 @@ pub struct ControllerData {
     /// Firmware revision
     pub firmware_revision: String,
     /// Maximum transfer size (in bytes)
-    pub max_transfer_size: u64,
+    pub max_transfer_size: usize,
     /// Minimum page size (in bytes)
     pub min_pagesize: usize,
     /// Maximum queue entries
@@ -140,7 +140,7 @@ impl Namespace {
 /// A structure representing an NVMe controller device.
 pub struct Device<A> {
     address: *mut u8,
-    pub(crate) allocator: Rc<A>,
+    pub(crate) allocator: Arc<A>,
     pub(crate) admin_sq: SubQueue,
     admin_cq: CompQueue,
     admin_buffer: Dma<u8>,
@@ -167,7 +167,7 @@ impl<A: Allocator> Device<A> {
             admin_buffer: Dma::allocate(4096, &allocator),
             doorbell_helper: DoorbellHelper::new(address, 0),
             data: Default::default(),
-            allocator: Rc::new(allocator),
+            allocator: Arc::new(allocator),
         };
 
         let cap = device.get_reg::<u64>(Register::CAP);
@@ -214,7 +214,7 @@ impl<A: Allocator> Device<A> {
         device.data.firmware_revision = extract_string(64, 72);
 
         let max_pages = 1 << device.admin_buffer.as_ref()[77];
-        device.data.max_transfer_size = max_pages as u64 * device.data.min_pagesize as u64;
+        device.data.max_transfer_size = max_pages as usize * device.data.min_pagesize;
 
         Ok(device)
     }
@@ -323,11 +323,11 @@ impl<A: Allocator> Device<A> {
     ///
     /// Returns an error if the queue size is less than 2 or exceeds the
     /// maximum number of queue entries.
-    pub fn create_io_queue_pair<'a>(
+    pub fn create_io_queue_pair(
         &mut self,
-        namespace: &'a Namespace,
+        namespace: Namespace,
         len: usize,
-    ) -> Result<IoQueuePair<'a, A>> {
+    ) -> Result<IoQueuePair<A>> {
         if len < 2 {
             return Err(Error::QueueSizeTooSmall);
         }
@@ -372,9 +372,9 @@ impl<A: Allocator> Device<A> {
     /// allocated for the queues.
     pub fn delete_io_queue_pair(&mut self, qpair: IoQueuePair<A>) -> Result<()> {
         let cmd_id = self.admin_sq.tail as u16;
-        let command = Command::delete_submission_queue(cmd_id, *qpair.id);
+        let command = Command::delete_submission_queue(cmd_id, *qpair.id());
         self.exec_admin(command)?;
-        let command = Command::delete_completion_queue(cmd_id, *qpair.id);
+        let command = Command::delete_completion_queue(cmd_id, *qpair.id());
         self.exec_admin(command)?;
         Ok(())
     }

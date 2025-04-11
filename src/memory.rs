@@ -51,6 +51,9 @@ pub(crate) struct Dma<T> {
     count: usize,
 }
 
+unsafe impl<T> Send for Dma<T> {}
+unsafe impl<T> Sync for Dma<T> {}
+
 impl<T> Deref for Dma<T> {
     type Target = [T];
 
