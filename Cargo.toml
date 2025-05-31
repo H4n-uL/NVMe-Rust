@@ -2,7 +2,7 @@
 name = "nvme"
 version = "0.3.0"
 edition = "2024"
-repository = "https://github.com/lihanrui2913/nvme"
-description = "A simple NVMe driver"
+repository = "https://github.com/H4n-uL/NVMe-Rust"
+description = "Bare-metal NVMe driver"
 license = "MIT/Apache-2.0"
 keywords = ["nvme", "pcie", "no_std"]
