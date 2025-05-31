@@ -19,6 +19,8 @@ pub enum Error {
     QueueSizeExceedsMqes,
     /// Command failed with a specific status code.
     CommandFailed(u16),
+    /// Invalid namespace ID.
+    InvalidNamespace,
 }
 
 impl core::error::Error for Error {}
@@ -49,6 +51,9 @@ impl Display for Error {
             }
             Error::CommandFailed(code) => {
                 write!(f, "Command failed with status code: {}", code)
+            }
+            Error::InvalidNamespace => {
+                write!(f, "Invalid namespace ID")
             }
         }
     }

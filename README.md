@@ -4,12 +4,12 @@ A no-std compatible NVMe driver for embedded and operating system development.
 
 ## Usage
 
-You need create a allocator that implements the `NvmeAllocator` trait.
+You need create a allocator that implements the `NVMeAllocator` trait.
 
 ```rust
-pub struct NvmeAllocator;
+pub struct NVMeAllocator;
 
-impl Allocator for NvmeAllocator {
+impl Allocator for NVMeAllocator {
     unsafe fn allocate(&self, size: usize) -> usize {
         DmaManager::allocate(size)
     }
@@ -34,17 +34,11 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     // Some useful data you may want to see
     let _controller_data = controller.controller_data();
 
-    // Identify all namespaces (base 0)
-    let namespaces = controller.identify_namespaces(0)?;
-
     // Select the first namespace
-    let namespace = &namespaces[0];
+    let namespace = controller.get_ns(1)?;
 
     // You can get the block size and count of the namespace
-    let _disk_size = namespace.block_count * namespace.block_size;
-
-    // Create a I/O queue pair to perform IO operations
-    let mut qpair = controller.create_io_queue_pair(namespacem, 64)?;
+    let _disk_size = namespace.total_size();
 
     // Should not be larger than controller_data.max_transfer_size
     const TEST_LENGTH: usize = 524288;
@@ -55,7 +49,7 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     let read_buffer = unsafe { core::slice::from_raw_parts_mut(read_buffer_ptr, TEST_LENGTH) };
 
     // Read `TEST_LENGTH` bytes starting from LBA 34
-    qpair.read(read_buffer.as_mut_ptr(), read_buffer.len(), 34)?;
+    namespace.read(34, &mut read_buffer)?;
 
     // Create a 4096 byte aligned write buffer
     let write_buffer_ptr = unsafe { ALLOCATOR.alloc(layout) };
@@ -67,10 +61,10 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     }
 
     // Write the buffer to the disk starting from LBA 34
-    qpair.write(write_buffer.as_ptr(), write_buffer.len(), 34)?;
+    namespace.write(34, &write_buffer)?;
 
     // Read back the data to verify correctness
-    qpair.read(read_buffer.as_mut_ptr(), read_buffer.len(), 34)?;
+    namespace.read(34, &mut read_buffer)?;
 
     // Verify the data byte-by-byte
     for (i, (read, write)) in read_buffer.iter().zip(write_buffer.iter()).enumerate() {
@@ -80,8 +74,11 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
         }
     }
 
-    // Delete the I/O queue pair to release resources
-    controller.delete_io_queue_pair(qpair)?;
+    // Don't forget to free the buffer
+    unsafe {
+        ALLOCATOR.dealloc(read_buffer_ptr, layout);
+        ALLOCATOR.dealloc(write_buffer_ptr, layout);
+    }
 
     Ok(())
 }

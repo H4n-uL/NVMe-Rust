@@ -11,11 +11,9 @@ extern crate alloc;
 mod cmd;
 mod device;
 mod error;
-mod io;
 mod memory;
 mod queues;
 
 pub use device::{ControllerData, Device, Namespace};
 pub use error::Error;
-pub use io::IoQueuePair;
 pub use memory::Allocator;
