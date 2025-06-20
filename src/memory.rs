@@ -35,7 +35,7 @@ pub trait Allocator {
     ///
     /// This is unsafe because:
     /// - The memory should be returned by the allocator and not freed already
-    unsafe fn deallocate(&self, addr: usize);
+    unsafe fn deallocate(&self, addr: usize, size: usize);
 }
 
 /// Represents a DMA (Direct Memory Access) buffer.
@@ -49,6 +49,7 @@ pub(crate) struct Dma<T> {
     pub addr: *mut T,
     pub phys_addr: usize,
     count: usize,
+    size: usize,
 }
 
 unsafe impl<T> Send for Dma<T> {}
@@ -89,7 +90,7 @@ impl<T> Dma<T> {
         Self {
             addr: addr as *mut T,
             phys_addr: allocator.translate(addr),
-            count,
+            count, size: aligned,
         }
     }
 
@@ -101,7 +102,7 @@ impl<T> Dma<T> {
     /// After calling this method, the Dma instance should not be used anymore.
     pub fn deallocate<A: Allocator>(&self, allocator: &A) {
         unsafe {
-            allocator.deallocate(self.addr as usize);
+            allocator.deallocate(self.addr as usize, self.size);
         }
     }
 }
