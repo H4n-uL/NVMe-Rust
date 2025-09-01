@@ -1,8 +1,11 @@
 [package]
-name = "nvme"
-version = "0.4.0"
+name = "nvme-rs"
+version = "0.4.1"
 edition = "2024"
 repository = "https://github.com/H4n-uL/NVMe-Rust"
-description = "Bare-metal NVMe driver"
+description = "Bare-metal NVMe driver which will never be yanked"
 license = "MIT/Apache-2.0"
 keywords = ["nvme", "pcie", "no_std"]
+
+[dependencies]
+spin = "0.10.0"

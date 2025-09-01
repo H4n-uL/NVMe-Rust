@@ -2,8 +2,8 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::cell::RefCell;
 use core::hint::spin_loop;
+use spin::Mutex;
 
 use crate::cmd::{Command, IdentifyType};
 use crate::error::{Error, Result};
@@ -115,12 +115,12 @@ struct IoState {
     prp_manager: PrpManager,
 }
 
-/// Internal device state - now uses RefCell for interior mutability
+/// Internal device state - uses spin::Mutex for thread-safe interior mutability
 struct DeviceInner<A: Allocator> {
     allocator: Arc<A>,
-    doorbell_helper: RefCell<DoorbellHelper>,
-    data: RefCell<ControllerData>,
-    io_state: RefCell<IoState>,
+    doorbell_helper: Mutex<DoorbellHelper>,
+    data: Mutex<ControllerData>,
+    io_state: Mutex<IoState>,
 }
 
 /// A structure representing an NVMe namespace.
@@ -165,12 +165,12 @@ impl<A: Allocator> Namespace<A> {
 
     /// Perform I/O operation.
     fn do_io(&self, lba: u64, address: usize, bytes: usize, write: bool) -> Result<()> {
-        let max_transfer_size = self.device.data.borrow().max_transfer_size;
+        let max_transfer_size = self.device.data.lock().max_transfer_size;
         if bytes > max_transfer_size {
             return Err(Error::IoSizeExceedsMdts);
         }
 
-        let mut io_state = self.device.io_state.borrow_mut();
+        let mut io_state = self.device.io_state.lock();
 
         // Create PRP list
         let prp_result = io_state.prp_manager.create(self.device.allocator.as_ref(), address, bytes)?;
@@ -189,11 +189,11 @@ impl<A: Allocator> Namespace<A> {
 
         // Submit command
         let tail = io_state.io_sq.push(command);
-        self.device.doorbell_helper.borrow().write(Doorbell::SubTail(1), tail as u32);
+        self.device.doorbell_helper.lock().write(Doorbell::SubTail(1), tail as u32);
 
         // Wait for completion
         let (head, entry) = io_state.io_cq.pop();
-        self.device.doorbell_helper.borrow().write(Doorbell::CompHead(1), head as u32);
+        self.device.doorbell_helper.lock().write(Doorbell::CompHead(1), head as u32);
         io_state.io_sq.head = entry.sq_head as usize;
 
         // Release PRP resources
@@ -240,9 +240,9 @@ impl<A: Allocator> Device<A> {
 
         let inner = Arc::new(DeviceInner {
             allocator: allocator.clone(),
-            doorbell_helper: RefCell::new(doorbell_helper),
-            data: RefCell::new(Default::default()),
-            io_state: RefCell::new(IoState {
+            doorbell_helper: Mutex::new(doorbell_helper),
+            data: Mutex::new(Default::default()),
+            io_state: Mutex::new(IoState {
                 io_sq: SubQueue::new(IO_QUEUE_SIZE, allocator.as_ref()),
                 io_cq: CompQueue::new(IO_QUEUE_SIZE, allocator.as_ref()),
                 prp_manager: Default::default(),
@@ -262,10 +262,10 @@ impl<A: Allocator> Device<A> {
         let cap = device.get_reg::<u64>(Register::CAP);
         let doorbell_stride = (cap >> 32) as u8 & 0xF;
 
-        // Update inner fields safely using RefCell
-        *device.inner.doorbell_helper.borrow_mut() = DoorbellHelper::new(address, doorbell_stride);
+        // Update inner fields safely using Mutex
+        *device.inner.doorbell_helper.lock() = DoorbellHelper::new(address, doorbell_stride);
         {
-            let mut data = device.inner.data.borrow_mut();
+            let mut data = device.inner.data.lock();
             data.min_pagesize = 1 << (((cap >> 48) as u8 & 0xF) + 12);
             data.max_queue_entries = (cap & 0x7FFF) as u16 + 1;
         }
@@ -307,9 +307,9 @@ impl<A: Allocator> Device<A> {
                 .to_string()
         };
 
-        // Update controller data safely using RefCell
+        // Update controller data safely using Mutex
         {
-            let mut data = device.inner.data.borrow_mut();
+            let mut data = device.inner.data.lock();
             data.serial_number = extract_string(4, 24);
             data.model_number = extract_string(24, 64);
             data.firmware_revision = extract_string(64, 72);
@@ -336,15 +336,15 @@ impl<A: Allocator> Device<A> {
 
     /// Get controller data.
     pub fn controller_data(&self) -> ControllerData {
-        self.inner.data.borrow().clone()
+        self.inner.data.lock().clone()
     }
 
     /// Create I/O queues.
     fn create_io_queues(&mut self) -> Result<()> {
-        let max_queue_entries = self.inner.data.borrow().max_queue_entries;
+        let max_queue_entries = self.inner.data.lock().max_queue_entries;
         let queue_size = IO_QUEUE_SIZE.min(max_queue_entries as usize);
         let (io_cq_addr, io_sq_addr) = {
-            let io_state = self.inner.io_state.borrow();
+            let io_state = self.inner.io_state.lock();
             (io_state.io_cq.address(), io_state.io_sq.address())
         };
 
@@ -445,10 +445,10 @@ impl<A: Allocator> Device<A> {
     /// Execute an admin command.
     fn exec_admin(&mut self, cmd: Command) -> Result<Completion> {
         let tail = self.admin_sq.push(cmd);
-        self.inner.doorbell_helper.borrow().write(Doorbell::SubTail(0), tail as u32);
+        self.inner.doorbell_helper.lock().write(Doorbell::SubTail(0), tail as u32);
 
         let (head, entry) = self.admin_cq.pop();
-        self.inner.doorbell_helper.borrow().write(Doorbell::CompHead(0), head as u32);
+        self.inner.doorbell_helper.lock().write(Doorbell::CompHead(0), head as u32);
 
         let status = (entry.status >> 1) & 0xff;
         if status != 0 {
