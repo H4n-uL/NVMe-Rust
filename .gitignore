@@ -1,1 +1,12 @@
+#---------------- RUST ----------------#
+
+## Compiled sources ##
 /target
+
+## lock file ##
+Cargo.lock
+
+#------------ SYSTEM FILES ------------#
+
+## macOS ##
+.DS_Store
