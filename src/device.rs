@@ -121,6 +121,7 @@ struct DeviceInner<A: Allocator> {
     doorbell_helper: Mutex<DoorbellHelper>,
     data: Mutex<ControllerData>,
     io_state: Mutex<IoState>,
+    shutting_down: Mutex<bool>,
 }
 
 /// A structure representing an NVMe namespace.
@@ -165,6 +166,11 @@ impl<A: Allocator> Namespace<A> {
 
     /// Perform I/O operation.
     fn do_io(&self, lba: u64, address: usize, bytes: usize, write: bool) -> Result<()> {
+        // Check if device is shutting down
+        if *self.device.shutting_down.lock() {
+            return Err(Error::DeviceShuttingDown);
+        }
+
         let max_transfer_size = self.device.data.lock().max_transfer_size;
         if bytes > max_transfer_size {
             return Err(Error::IoSizeExceedsMdts);
@@ -247,6 +253,7 @@ impl<A: Allocator> Device<A> {
                 io_cq: CompQueue::new(IO_QUEUE_SIZE, allocator.as_ref()),
                 prp_manager: Default::default(),
             }),
+            shutting_down: Mutex::new(false),
         });
 
         let mut device = Self {
@@ -472,10 +479,28 @@ impl<A: Allocator> Device<A> {
 
 impl<A: Allocator> Drop for Device<A> {
     fn drop(&mut self) {
-        // Best effort cleanup - ignore errors during drop
+        // 1. Set shutdown flag to prevent new I/O
+        *self.inner.shutting_down.lock() = true;
+
+        // 2. Flush all namespaces to ensure data persistence
+        for &ns_id in self.namespaces.keys() {
+            // Send flush command through I/O queue
+            let mut io_state = self.inner.io_state.lock();
+            let flush_cmd = Command::flush(io_state.io_sq.tail as u16, ns_id);
+            let tail = io_state.io_sq.push(flush_cmd);
+
+            self.inner.doorbell_helper.lock().write(Doorbell::SubTail(1), tail as u32);
+            let (head, _entry) = io_state.io_cq.pop();
+            self.inner.doorbell_helper.lock().write(Doorbell::CompHead(1), head as u32);
+            // Don't check status in Drop - best effort
+        }
+
+        // 3. Try to delete queues gracefully
+        // If it fails, the reset will clean up anyway
         let _ = self.destroy_io_queues();
 
-        // Reset controller
+        // 4. Reset controller to ensure clean shutdown
+        // No need to wait - data is already persisted via flush
         self.set_reg::<u32>(Register::CC,
             self.get_reg::<u32>(Register::CC) & !1);
     }
