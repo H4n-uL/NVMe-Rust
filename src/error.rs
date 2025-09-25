@@ -190,6 +190,20 @@ pub enum Error {
     NvmeStatus(StatusCode),
     /// Device is shutting down.
     DeviceShuttingDown,
+    /// Failed to create I/O queues.
+    QueueCreationFailed,
+    /// Invalid queue ID specified.
+    InvalidQueueId,
+    /// Queue not found.
+    QueueNotFound,
+    /// Cannot remove the last queue.
+    LastQueueCannotBeRemoved,
+    /// Invalid queue count.
+    InvalidQueueCount,
+    /// Too many queues requested.
+    TooManyQueues,
+    /// No active queues available.
+    NoActiveQueues,
 }
 
 impl core::error::Error for Error {}
@@ -253,6 +267,27 @@ impl Display for Error {
             }
             Error::DeviceShuttingDown => {
                 write!(f, "Device is shutting down")
+            }
+            Error::QueueCreationFailed => {
+                write!(f, "Failed to create I/O queues")
+            }
+            Error::InvalidQueueId => {
+                write!(f, "Invalid queue ID specified")
+            }
+            Error::QueueNotFound => {
+                write!(f, "Queue not found")
+            }
+            Error::LastQueueCannotBeRemoved => {
+                write!(f, "Cannot remove the last I/O queue")
+            }
+            Error::InvalidQueueCount => {
+                write!(f, "Invalid queue count")
+            }
+            Error::TooManyQueues => {
+                write!(f, "Too many queues requested")
+            }
+            Error::NoActiveQueues => {
+                write!(f, "No active I/O queues available")
             }
         }
     }

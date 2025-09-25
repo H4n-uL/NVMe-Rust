@@ -34,7 +34,7 @@ mod power;
 mod security;
 
 // Core exports
-pub use device::{ControllerData, Device, Namespace};
+pub use device::{ControllerData, NVMeDevice, Namespace};
 pub use error::{Error, StatusCode, StatusCodeType};
 pub use memory::Allocator;
 

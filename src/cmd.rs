@@ -98,6 +98,7 @@ pub(crate) enum LogPageId {
     LbaStatusInformation = 0x0E,
     EnduranceGroupEventAggregate = 0x0F,
     MediaUnitStatus = 0x10,
+    SanitizeStatus = 0x81,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -556,6 +557,20 @@ impl Command {
             cmd_10: sdlba as u32,
             cmd_11: (sdlba >> 32) as u32,
             cmd_12: ((desc_format as u32) << 4) | (nr as u32),
+            ..Default::default()
+        }
+    }
+
+    pub fn device_self_test(
+        cmd_id: u16,
+        ns_id: u32,
+        action: u8,
+    ) -> Self {
+        Self {
+            opcode: OPCODE_DEVICE_SELF_TEST,
+            cmd_id,
+            ns_id,
+            cmd_10: action as u32,
             ..Default::default()
         }
     }

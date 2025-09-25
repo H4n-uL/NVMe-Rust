@@ -8,11 +8,11 @@ use crate::memory::{Dma, Allocator};
 #[derive(Debug, Clone)]
 #[repr(C, packed)]
 pub(crate) struct Completion {
-    command_specific: u32,
+    pub command_specific: u32,
     _rsvd: u32,
     pub sq_head: u16,
-    sq_id: u16,
-    cmd_id: u16,
+    pub sq_id: u16,
+    pub cmd_id: u16,
     pub status: u16,
 }
 

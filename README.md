@@ -29,7 +29,7 @@ Here is a complete example of a full routine that initializes the NVMe controlle
 ```rust
 pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     // Init the NVMe controller
-    let controller = Device::init(virtual_address, Allocator)?;
+    let controller = NVMeDevice::init(virtual_address, Allocator)?;
 
     // Some useful data you may want to see
     let _controller_data = controller.controller_data();
@@ -83,3 +83,9 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     Ok(())
 }
 ```
+
+## What is `Abandoned (c)` @ LICENCE file?
+
+I was using `nvme` crate, and one day original maintainers yanked all versions and nuked repo
+
+luckily I had a cloned version(this) which fixed a spec violation before yank.

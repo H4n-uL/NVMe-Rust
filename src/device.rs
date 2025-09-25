@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
 
 use crate::cmd::{Command, IdentifyType};
@@ -18,6 +19,100 @@ const ADMIN_QUEUE_SIZE: usize = 64;
 
 /// Default size of I/O queues.
 const IO_QUEUE_SIZE: usize = 256;
+
+/// Default number of I/O queue pairs.
+const DEFAULT_IO_QUEUES: usize = 4;
+
+/// Maximum number of I/O queue pairs.
+const MAX_IO_QUEUES: usize = 64;
+
+/// Temperature threshold type.
+#[derive(Debug, Clone, Copy)]
+pub enum TempThresholdType {
+    /// Over temperature threshold
+    OverTemp,
+    /// Under temperature threshold
+    UnderTemp,
+}
+
+/// Self-test type.
+#[derive(Debug, Clone, Copy)]
+pub enum SelfTestType {
+    /// Short device self-test (~ 2 minutes)
+    Short,
+    /// Extended device self-test (varies)
+    Extended,
+    /// Abort running self-test
+    Abort,
+}
+
+/// Self-test result.
+#[derive(Debug, Clone)]
+pub struct SelfTestResult {
+    /// Current self-test operation
+    pub current_operation: u8,
+    /// Current self-test completion percentage
+    pub current_completion: u8,
+    /// Historical test results
+    pub results: Vec<u8>,
+}
+
+/// Error log entry.
+#[derive(Debug, Clone)]
+pub struct ErrorLogEntry {
+    /// Error count
+    pub error_count: u64,
+    /// Submission queue ID
+    pub sqid: u16,
+    /// Command ID
+    pub cmdid: u16,
+    /// Status field
+    pub status: u16,
+    /// Parameter error location
+    pub parameter_error_location: u16,
+    /// LBA of error
+    pub lba: u64,
+    /// Namespace
+    pub namespace: u32,
+    /// Vendor specific info
+    pub vendor_specific: u8,
+    /// Transport type
+    pub trtype: u8,
+    /// Command specific info
+    pub command_specific: u64,
+    /// Transport specific
+    pub transport_specific: u16,
+}
+
+
+/// Endurance group information.
+#[derive(Debug, Clone)]
+pub struct EnduranceGroupInfo {
+    /// Critical warning
+    pub critical_warning: u8,
+    /// Available spare
+    pub available_spare: u8,
+    /// Available spare threshold
+    pub available_spare_threshold: u8,
+    /// Percentage used
+    pub percentage_used: u8,
+    /// Endurance estimate
+    pub endurance_estimate: u128,
+    /// Data units read
+    pub data_units_read: u128,
+    /// Data units written
+    pub data_units_written: u128,
+    /// Media units written
+    pub media_units_written: u128,
+    /// Host read commands
+    pub host_read_commands: u128,
+    /// Host write commands
+    pub host_write_commands: u128,
+    /// Media errors
+    pub media_errors: u128,
+    /// Number of error log entries
+    pub num_error_entries: u128,
+}
 
 /// NVMe controller registers.
 #[derive(Debug)]
@@ -108,11 +203,20 @@ pub struct ControllerData {
     pub max_queue_entries: u16,
 }
 
-/// Internal I/O state with interior mutability.
-struct IoState {
-    io_sq: SubQueue,
-    io_cq: CompQueue,
+/// I/O queue pair representing submission and completion queues.
+struct IoQueuePair {
+    /// Queue ID (1-based for I/O queues)
+    qid: u16,
+    /// Submission queue
+    sq: SubQueue,
+    /// Completion queue
+    cq: CompQueue,
+    /// PRP manager for this queue
     prp_manager: PrpManager,
+    /// Number of outstanding commands
+    outstanding: AtomicUsize,
+    /// Queue shutdown flag - when true, no new I/O accepted
+    shutdown: AtomicBool,
 }
 
 /// Internal device state - uses spin::Mutex for thread-safe interior mutability
@@ -120,7 +224,9 @@ struct DeviceInner<A: Allocator> {
     allocator: Arc<A>,
     doorbell_helper: Mutex<DoorbellHelper>,
     data: Mutex<ControllerData>,
-    io_state: Mutex<IoState>,
+    io_queues: Mutex<Vec<Arc<Mutex<IoQueuePair>>>>,
+    queue_selector: AtomicUsize,
+    next_queue_id: AtomicUsize,
     shutting_down: Mutex<bool>,
 }
 
@@ -164,6 +270,259 @@ impl<A: Allocator> Namespace<A> {
         self.do_io(lba, buf.as_ptr() as usize, buf.len(), true)
     }
 
+    /// Select the optimal I/O queue for this operation.
+    fn select_queue(&self) -> Option<Arc<Mutex<IoQueuePair>>> {
+        let queues = self.device.io_queues.lock();
+        if queues.is_empty() {
+            return None;
+        }
+
+        // Filter out shutdown queues
+        let active_queues: Vec<_> = queues
+            .iter()
+            .filter(|q| !q.lock().shutdown.load(Ordering::Acquire))
+            .cloned()
+            .collect();
+
+        if active_queues.is_empty() {
+            return None;
+        }
+
+        if active_queues.len() == 1 {
+            return Some(active_queues[0].clone());
+        }
+
+        // Try to find least loaded active queue
+        let mut min_outstanding = usize::MAX;
+        let mut selected_queue = None;
+
+        for queue in active_queues.iter() {
+            let outstanding = queue.lock().outstanding.load(Ordering::Relaxed);
+            if outstanding < min_outstanding {
+                min_outstanding = outstanding;
+                selected_queue = Some(queue.clone());
+            }
+        }
+
+        // If all queues are equally loaded, use round-robin
+        selected_queue.or_else(|| {
+            let idx = self.device.queue_selector.fetch_add(1, Ordering::Relaxed) % active_queues.len();
+            Some(active_queues[idx].clone())
+        })
+    }
+
+    /// TRIM/Discard - Essential for SSD performance and lifetime.
+    /// Informs the controller that specified LBA ranges contain no valid data.
+    pub fn trim(&self, lba: u64, block_count: u64) -> Result<()> {
+        // Check if device is shutting down
+        if *self.device.shutting_down.lock() {
+            return Err(Error::DeviceShuttingDown);
+        }
+
+        let queue_arc = self.select_queue().ok_or(Error::NoActiveQueues)?;
+        let mut queue = queue_arc.lock();
+        queue.outstanding.fetch_add(1, Ordering::Relaxed);
+
+        // Prepare dataset management ranges (up to 256 ranges)
+        let range_data = [(lba as u32, (lba >> 32) as u32, block_count as u32)];
+        let range_addr = range_data.as_ptr() as usize;
+
+        let cmd = Command::dataset_management(
+            queue.sq.tail as u16,
+            self.id,
+            range_addr,
+            0, // nr = 0 means 1 range
+            true, // ad = true for deallocate (TRIM)
+            false,
+            false,
+        );
+
+        // Submit and wait
+        let tail = queue.sq.push(cmd);
+        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+
+        let (head, entry) = queue.cq.pop();
+        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        queue.sq.head = entry.sq_head as usize;
+        queue.outstanding.fetch_sub(1, Ordering::Relaxed);
+
+        let status = (entry.status >> 1) & 0xff;
+        if status != 0 {
+            return Err(Error::CommandFailed(status));
+        }
+
+        Ok(())
+    }
+
+    /// Write Zeroes - Efficient zeroing without data transfer.
+    /// Much faster than writing actual zero buffers.
+    pub fn write_zeroes(&self, lba: u64, block_count: u16) -> Result<()> {
+        // Check if device is shutting down
+        if *self.device.shutting_down.lock() {
+            return Err(Error::DeviceShuttingDown);
+        }
+
+        let queue_arc = self.select_queue().ok_or(Error::NoActiveQueues)?;
+        let mut queue = queue_arc.lock();
+        queue.outstanding.fetch_add(1, Ordering::Relaxed);
+
+        let cmd = Command::write_zeroes(
+            queue.sq.tail as u16,
+            self.id,
+            lba,
+            block_count - 1,
+            false, // deac = deallocate after write
+        );
+
+        let tail = queue.sq.push(cmd);
+        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+
+        let (head, entry) = queue.cq.pop();
+        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        queue.sq.head = entry.sq_head as usize;
+        queue.outstanding.fetch_sub(1, Ordering::Relaxed);
+
+        let status = (entry.status >> 1) & 0xff;
+        if status != 0 {
+            return Err(Error::CommandFailed(status));
+        }
+
+        Ok(())
+    }
+
+    /// Compare - Atomically compare data without transferring to host.
+    /// Essential for lock-free algorithms and database implementations.
+    pub fn compare(&self, lba: u64, expected: &[u8]) -> Result<bool> {
+        if expected.len() as u64 % self.block_size != 0 {
+            return Err(Error::InvalidBufferSize);
+        }
+
+        // Check if device is shutting down
+        if *self.device.shutting_down.lock() {
+            return Err(Error::DeviceShuttingDown);
+        }
+
+        let queue_arc = self.select_queue().ok_or(Error::NoActiveQueues)?;
+        let mut queue = queue_arc.lock();
+        queue.outstanding.fetch_add(1, Ordering::Relaxed);
+
+        // Create PRP for expected data
+        let prp_result = queue.prp_manager.create(
+            self.device.allocator.as_ref(),
+            expected.as_ptr() as usize,
+            expected.len()
+        )?;
+        let prp = prp_result.get_prp();
+        let blocks = expected.len() as u64 / self.block_size;
+
+        let cmd = Command::compare(
+            queue.sq.tail as u16,
+            self.id,
+            lba,
+            blocks as u16 - 1,
+            [prp.0 as u64, prp.1 as u64],
+        );
+
+        let tail = queue.sq.push(cmd);
+        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+
+        let (head, entry) = queue.cq.pop();
+        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        queue.sq.head = entry.sq_head as usize;
+
+        // Release PRP resources
+        queue.prp_manager.release(prp_result, self.device.allocator.as_ref());
+        queue.outstanding.fetch_sub(1, Ordering::Relaxed);
+
+        let status = (entry.status >> 1) & 0xff;
+        if status == 0 {
+            Ok(true) // Compare matched
+        } else if status == 0x85 { // Compare Failure
+            Ok(false) // Compare didn't match
+        } else {
+            Err(Error::CommandFailed(status))
+        }
+    }
+
+    /// Verify - Check data integrity without transferring to host.
+    /// Critical for data scrubbing and integrity verification.
+    pub fn verify(&self, lba: u64, block_count: u16) -> Result<()> {
+        // Check if device is shutting down
+        if *self.device.shutting_down.lock() {
+            return Err(Error::DeviceShuttingDown);
+        }
+
+        let queue_arc = self.select_queue().ok_or(Error::NoActiveQueues)?;
+        let mut queue = queue_arc.lock();
+        queue.outstanding.fetch_add(1, Ordering::Relaxed);
+
+        let cmd = Command::verify(
+            queue.sq.tail as u16,
+            self.id,
+            lba,
+            block_count - 1,
+        );
+
+        let tail = queue.sq.push(cmd);
+        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+
+        let (head, entry) = queue.cq.pop();
+        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        queue.sq.head = entry.sq_head as usize;
+        queue.outstanding.fetch_sub(1, Ordering::Relaxed);
+
+        let status = (entry.status >> 1) & 0xff;
+        if status != 0 {
+            return Err(Error::CommandFailed(status));
+        }
+
+        Ok(())
+    }
+
+    /// Copy - Server-side copy without host involvement.
+    /// Essential for efficient data migration and backup.
+    pub fn copy(&self, src_lba: u64, dst_lba: u64, block_count: u16) -> Result<()> {
+        // Check if device is shutting down
+        if *self.device.shutting_down.lock() {
+            return Err(Error::DeviceShuttingDown);
+        }
+
+        let queue_arc = self.select_queue().ok_or(Error::NoActiveQueues)?;
+        let mut queue = queue_arc.lock();
+        queue.outstanding.fetch_add(1, Ordering::Relaxed);
+
+        // Copy descriptor format 0 (simple copy)
+        let copy_desc = [
+            src_lba as u64,
+            (src_lba >> 32) as u64 | ((block_count as u64 - 1) << 32),
+        ];
+        let desc_addr = copy_desc.as_ptr() as usize;
+
+        let cmd = Command::copy(
+            queue.sq.tail as u16,
+            self.id,
+            desc_addr,
+            dst_lba,
+            0, // nr = 0 means 1 source range
+            0, // desc_format = 0 for simple copy
+        );
+
+        let tail = queue.sq.push(cmd);
+        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+
+        let (head, entry) = queue.cq.pop();
+        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        queue.sq.head = entry.sq_head as usize;
+        queue.outstanding.fetch_sub(1, Ordering::Relaxed);
+
+        let status = (entry.status >> 1) & 0xff;
+        if status != 0 {
+            return Err(Error::CommandFailed(status));
+        }
+
+        Ok(())
+    }
+
     /// Perform I/O operation.
     fn do_io(&self, lba: u64, address: usize, bytes: usize, write: bool) -> Result<()> {
         // Check if device is shutting down
@@ -176,16 +535,19 @@ impl<A: Allocator> Namespace<A> {
             return Err(Error::IoSizeExceedsMdts);
         }
 
-        let mut io_state = self.device.io_state.lock();
+        // Select queue and perform I/O
+        let queue_arc = self.select_queue().ok_or(Error::NoActiveQueues)?;
+        let mut queue = queue_arc.lock();
+        queue.outstanding.fetch_add(1, Ordering::Relaxed);
 
         // Create PRP list
-        let prp_result = io_state.prp_manager.create(self.device.allocator.as_ref(), address, bytes)?;
+        let prp_result = queue.prp_manager.create(self.device.allocator.as_ref(), address, bytes)?;
         let prp = prp_result.get_prp();
         let blocks = bytes as u64 / self.block_size;
 
         // Create command
         let command = Command::read_write(
-            io_state.io_sq.tail as u16,
+            queue.sq.tail as u16,
             self.id,
             lba,
             blocks as u16 - 1,
@@ -194,16 +556,17 @@ impl<A: Allocator> Namespace<A> {
         );
 
         // Submit command
-        let tail = io_state.io_sq.push(command);
-        self.device.doorbell_helper.lock().write(Doorbell::SubTail(1), tail as u32);
+        let tail = queue.sq.push(command);
+        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
 
         // Wait for completion
-        let (head, entry) = io_state.io_cq.pop();
-        self.device.doorbell_helper.lock().write(Doorbell::CompHead(1), head as u32);
-        io_state.io_sq.head = entry.sq_head as usize;
+        let (head, entry) = queue.cq.pop();
+        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        queue.sq.head = entry.sq_head as usize;
 
         // Release PRP resources
-        io_state.prp_manager.release(prp_result, self.device.allocator.as_ref());
+        queue.prp_manager.release(prp_result, self.device.allocator.as_ref());
+        queue.outstanding.fetch_sub(1, Ordering::Relaxed);
 
         // Check status
         let status = (entry.status >> 1) & 0xff;
@@ -216,7 +579,7 @@ impl<A: Allocator> Namespace<A> {
 }
 
 /// A structure representing an NVMe controller device.
-pub struct Device<A: Allocator> {
+pub struct NVMeDevice<A: Allocator> {
     address: *mut u8,
     inner: Arc<DeviceInner<A>>,
 
@@ -229,10 +592,218 @@ pub struct Device<A: Allocator> {
     namespaces: BTreeMap<u32, Namespace<A>>,
 }
 
-unsafe impl<A: Allocator> Send for Device<A> {}
-unsafe impl<A: Allocator> Sync for Device<A> {}
+unsafe impl<A: Allocator> Send for NVMeDevice<A> {}
+unsafe impl<A: Allocator> Sync for NVMeDevice<A> {}
 
-impl<A: Allocator> Device<A> {
+impl<A: Allocator> NVMeDevice<A> {
+    /// Set the number of I/O queue pairs.
+    /// Will add or remove queues to match the target count.
+    /// When removing queues, it will:
+    /// 1. Mark queues for shutdown (no new I/O accepted)
+    /// 2. Wait for outstanding I/O to complete
+    /// 3. Remove the queues from hardware
+    pub fn set_io_queue_count(&mut self, target: usize) -> Result<()> {
+        if target == 0 {
+            return Err(Error::InvalidQueueCount);
+        }
+
+        if target > MAX_IO_QUEUES {
+            return Err(Error::TooManyQueues);
+        }
+
+        let current = self.inner.io_queues.lock().len();
+
+        if target > current {
+            // Add queues
+            for _ in current..target {
+                self.add_io_queue_internal()?;
+            }
+        } else if target < current {
+            // Remove queues safely
+            self.remove_io_queues_internal(current - target)?;
+        }
+
+        Ok(())
+    }
+
+    /// Get the current number of I/O queue pairs.
+    pub fn io_queue_count(&self) -> usize {
+        self.inner.io_queues.lock().len()
+    }
+
+    /// Get the current number of active (non-shutdown) I/O queue pairs.
+    pub fn active_io_queue_count(&self) -> usize {
+        self.inner.io_queues.lock()
+            .iter()
+            .filter(|q| !q.lock().shutdown.load(Ordering::Acquire))
+            .count()
+    }
+
+    /// Get statistics for each queue.
+    pub fn queue_stats(&self) -> Vec<(u16, usize, bool)> {
+        self.inner.io_queues.lock()
+            .iter()
+            .map(|q| {
+                let queue = q.lock();
+                (
+                    queue.qid,
+                    queue.outstanding.load(Ordering::Relaxed),
+                    queue.shutdown.load(Ordering::Relaxed)
+                )
+            })
+            .collect()
+    }
+
+    /// Internal method to add a new I/O queue pair.
+    fn add_io_queue_internal(&mut self) -> Result<u16> {
+        let max_queue_entries = self.inner.data.lock().max_queue_entries;
+        let queue_size = IO_QUEUE_SIZE.min(max_queue_entries as usize);
+
+        let qid = self.inner.next_queue_id.fetch_add(1, Ordering::SeqCst) as u16;
+        if qid > MAX_IO_QUEUES as u16 {
+            self.inner.next_queue_id.fetch_sub(1, Ordering::SeqCst);
+            return Err(Error::TooManyQueues);
+        }
+
+        // Create queue structures
+        let sq = SubQueue::new(queue_size, self.inner.allocator.as_ref());
+        let cq = CompQueue::new(queue_size, self.inner.allocator.as_ref());
+        let sq_addr = sq.address();
+        let cq_addr = cq.address();
+
+        // Create completion queue first
+        self.exec_admin(Command::create_completion_queue(
+            self.admin_sq.tail as u16,
+            qid,
+            cq_addr,
+            (queue_size - 1) as u16,
+        ))?;
+
+        // Create submission queue
+        self.exec_admin(Command::create_submission_queue(
+            self.admin_sq.tail as u16,
+            qid,
+            sq_addr,
+            (queue_size - 1) as u16,
+            qid, // Use same ID for CQ
+        ))?;
+
+        // Add to queue list
+        let queue_pair = Arc::new(Mutex::new(IoQueuePair {
+            qid,
+            sq,
+            cq,
+            prp_manager: Default::default(),
+            outstanding: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        }));
+
+        self.inner.io_queues.lock().push(queue_pair);
+        Ok(qid)
+    }
+
+    /// Internal method to remove specified number of I/O queues safely.
+    fn remove_io_queues_internal(&mut self, count: usize) -> Result<()> {
+        let queues_to_remove = {
+            let queues = self.inner.io_queues.lock();
+
+            // Don't remove if it would leave us with no queues
+            if queues.len() <= count {
+                return Err(Error::LastQueueCannotBeRemoved);
+            }
+
+            // Select queues to remove (prefer queues with least outstanding I/O)
+            let mut queue_stats: Vec<_> = queues.iter()
+                .map(|q| {
+                    let queue = q.lock();
+                    (q.clone(), queue.qid, queue.outstanding.load(Ordering::Relaxed))
+                })
+                .collect();
+
+            // Sort by outstanding I/O count
+            queue_stats.sort_by_key(|&(_, _, outstanding)| outstanding);
+
+            // Take the last 'count' queues (highest load)
+            queue_stats.into_iter()
+                .rev()
+                .take(count)
+                .map(|(arc, qid, _)| (arc, qid))
+                .collect::<Vec<_>>()
+        };
+
+        // Phase 1: Mark queues for shutdown
+        for (queue_arc, _) in &queues_to_remove {
+            queue_arc.lock().shutdown.store(true, Ordering::Release);
+        }
+
+        // Phase 2: Flush and wait for outstanding I/O to complete
+        // This is important for controlled queue removal to ensure data integrity
+        for (queue_arc, qid) in &queues_to_remove {
+            // Send flush command to ensure all writes are committed
+            for &ns_id in self.namespaces.keys() {
+                let mut queue = queue_arc.lock();
+
+                // Flush only shutdown queues, but ensure completion
+                if queue.shutdown.load(Ordering::Acquire) {
+                    let flush_cmd = Command::flush(queue.sq.tail as u16, ns_id);
+
+                    // Push flush command (blocking is OK here - controlled removal)
+                    let tail = queue.sq.push(flush_cmd);
+                    self.inner.doorbell_helper.lock().write(Doorbell::SubTail(*qid), tail as u32);
+
+                    // MUST wait for flush completion for data safety
+                    let (head, _entry) = queue.cq.pop();
+                    self.inner.doorbell_helper.lock().write(Doorbell::CompHead(*qid), head as u32);
+                    queue.sq.head = _entry.sq_head as usize;
+                }
+            }
+
+            // Wait for all outstanding I/O to complete
+            // This is necessary for controlled removal to avoid data loss
+            let mut wait_count = 0;
+            const MAX_WAIT: usize = 10000; // Prevent infinite wait
+
+            loop {
+                let outstanding = queue_arc.lock().outstanding.load(Ordering::Acquire);
+                if outstanding == 0 {
+                    break;
+                }
+
+                wait_count += 1;
+                if wait_count > MAX_WAIT {
+                    // Log warning or handle timeout
+                    break;
+                }
+
+                core::hint::spin_loop();
+            }
+        }
+
+        // Phase 3: Delete queues from hardware and remove from list
+        for (_, qid) in &queues_to_remove {
+            // Delete submission queue first (NVMe spec requirement)
+            self.exec_admin(Command::delete_submission_queue(
+                self.admin_sq.tail as u16,
+                *qid,
+            ))?;
+
+            // Then delete completion queue
+            self.exec_admin(Command::delete_completion_queue(
+                self.admin_sq.tail as u16,
+                *qid,
+            ))?;
+        }
+
+        // Phase 4: Remove from the queue list
+        let mut queues = self.inner.io_queues.lock();
+        queues.retain(|q| {
+            let qid = q.lock().qid;
+            !queues_to_remove.iter().any(|(_, remove_qid)| *remove_qid == qid)
+        });
+
+        Ok(())
+    }
+
     /// Initialize a NVMe controller device.
     ///
     /// The `address` is the base address of the controller
@@ -248,11 +819,9 @@ impl<A: Allocator> Device<A> {
             allocator: allocator.clone(),
             doorbell_helper: Mutex::new(doorbell_helper),
             data: Mutex::new(Default::default()),
-            io_state: Mutex::new(IoState {
-                io_sq: SubQueue::new(IO_QUEUE_SIZE, allocator.as_ref()),
-                io_cq: CompQueue::new(IO_QUEUE_SIZE, allocator.as_ref()),
-                prp_manager: Default::default(),
-            }),
+            io_queues: Mutex::new(Vec::new()),
+            queue_selector: AtomicUsize::new(0),
+            next_queue_id: AtomicUsize::new(1),
             shutting_down: Mutex::new(false),
         });
 
@@ -346,49 +915,67 @@ impl<A: Allocator> Device<A> {
         self.inner.data.lock().clone()
     }
 
-    /// Create I/O queues.
+    /// Create initial I/O queues.
     fn create_io_queues(&mut self) -> Result<()> {
-        let max_queue_entries = self.inner.data.lock().max_queue_entries;
-        let queue_size = IO_QUEUE_SIZE.min(max_queue_entries as usize);
-        let (io_cq_addr, io_sq_addr) = {
-            let io_state = self.inner.io_state.lock();
-            (io_state.io_cq.address(), io_state.io_sq.address())
-        };
-
-        // Create completion queue
-        self.exec_admin(Command::create_completion_queue(
-            self.admin_sq.tail as u16,
-            1, // Queue ID 1
-            io_cq_addr,
-            (queue_size - 1) as u16,
-        ))?;
-
-        // Create submission queue
-        self.exec_admin(Command::create_submission_queue(
-            self.admin_sq.tail as u16,
-            1, // Queue ID 1
-            io_sq_addr,
-            (queue_size - 1) as u16,
-            1, // Completion queue ID
-        ))?;
-
+        // Start with one I/O queue pair
+        self.add_io_queue_internal()?;
         Ok(())
     }
 
-    /// Destroy I/O queues.
+    /// Destroy all I/O queues.
+    /// Ensures all data is flushed before deletion.
     fn destroy_io_queues(&mut self) -> Result<()> {
-        // Delete submission queue first (spec requirement)
-        self.exec_admin(Command::delete_submission_queue(
-            self.admin_sq.tail as u16,
-            1, // Queue ID 1
-        ))?;
+        let queue_count = self.inner.io_queues.lock().len();
+        if queue_count > 0 {
+            // Phase 1: Mark all queues for shutdown
+            {
+                let queues = self.inner.io_queues.lock();
+                for queue in queues.iter() {
+                    queue.lock().shutdown.store(true, Ordering::Release);
+                }
+            }
 
-        // Then delete completion queue
-        self.exec_admin(Command::delete_completion_queue(
-            self.admin_sq.tail as u16,
-            1, // Queue ID 1
-        ))?;
+            // Phase 2: Flush all namespaces and wait for completion
+            // This is critical - we MUST ensure flushes complete for data safety
+            for &ns_id in self.namespaces.keys() {
+                let queues = self.inner.io_queues.lock().clone();
+                for queue_arc in queues.iter() {
+                    let mut queue = queue_arc.lock();
+                    let flush_cmd = Command::flush(queue.sq.tail as u16, ns_id);
 
+                    // Push flush command
+                    let tail = queue.sq.push(flush_cmd);
+                    self.inner.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+
+                    // Wait for flush completion - this is essential
+                    let (head, _entry) = queue.cq.pop();
+                    self.inner.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+                    queue.sq.head = _entry.sq_head as usize;
+                }
+            }
+
+            // Phase 3: Delete all queues from hardware
+            // Controller reset will handle any remaining I/O
+            let queues = self.inner.io_queues.lock().clone();
+            for queue_arc in queues.iter().rev() {
+                let qid = queue_arc.lock().qid;
+
+                // Delete submission queue first (spec requirement)
+                self.exec_admin(Command::delete_submission_queue(
+                    self.admin_sq.tail as u16,
+                    qid,
+                ))?;
+
+                // Then delete completion queue
+                self.exec_admin(Command::delete_completion_queue(
+                    self.admin_sq.tail as u16,
+                    qid,
+                ))?;
+            }
+        }
+
+        self.inner.io_queues.lock().clear();
+        self.inner.next_queue_id.store(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -466,7 +1053,7 @@ impl<A: Allocator> Device<A> {
     }
 }
 
-impl<A: Allocator> Device<A> {
+impl<A: Allocator> NVMeDevice<A> {
     /// Get the version of the NVMe controller.
     pub fn nvme_version(&self) -> (u16, u8, u8) {
         let version = self.get_reg::<u32>(Register::VS);
@@ -477,30 +1064,35 @@ impl<A: Allocator> Device<A> {
     }
 }
 
-impl<A: Allocator> Drop for Device<A> {
+impl<A: Allocator> Drop for NVMeDevice<A> {
     fn drop(&mut self) {
-        // 1. Set shutdown flag to prevent new I/O
+        // 1. Set global shutdown flag
         *self.inner.shutting_down.lock() = true;
 
-        // 2. Flush all namespaces to ensure data persistence
+        // 2. Flush each namespace on each queue
         for &ns_id in self.namespaces.keys() {
-            // Send flush command through I/O queue
-            let mut io_state = self.inner.io_state.lock();
-            let flush_cmd = Command::flush(io_state.io_sq.tail as u16, ns_id);
-            let tail = io_state.io_sq.push(flush_cmd);
+            let queues = self.inner.io_queues.lock().clone();
+            for queue_arc in queues.iter() {
+                let mut queue = queue_arc.lock();
 
-            self.inner.doorbell_helper.lock().write(Doorbell::SubTail(1), tail as u32);
-            let (head, _entry) = io_state.io_cq.pop();
-            self.inner.doorbell_helper.lock().write(Doorbell::CompHead(1), head as u32);
-            // Don't check status in Drop - best effort
+                // Mark shutdown and send flush
+                queue.shutdown.store(true, Ordering::Release);
+
+                let flush_cmd = Command::flush(queue.sq.tail as u16, ns_id);
+                let tail = queue.sq.push(flush_cmd);
+                self.inner.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+
+                // Wait for flush completion
+                let (head, entry) = queue.cq.pop();
+                self.inner.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+                queue.sq.head = entry.sq_head as usize;
+            }
         }
 
-        // 3. Try to delete queues gracefully
-        // If it fails, the reset will clean up anyway
+        // 3. Destroy queues
         let _ = self.destroy_io_queues();
 
-        // 4. Reset controller to ensure clean shutdown
-        // No need to wait - data is already persisted via flush
+        // 4. Reset controller
         self.set_reg::<u32>(Register::CC,
             self.get_reg::<u32>(Register::CC) & !1);
     }
