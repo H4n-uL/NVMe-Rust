@@ -6,25 +6,19 @@ use core::hint::spin_loop;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::{Mutex, RwLock};
 
-use crate::cmd::{Command, IdentifyType};
+use crate::cmd::{Command, IdentifyType, FeatureId};
 use crate::error::{Error, Result};
 use crate::memory::{Allocator, Dma, PrpManager};
 use crate::queues::{CompQueue, Completion, SubQueue};
 
-/// Default size of an admin queue.
+/// Minimum size of an admin queue.
 ///
-/// Here choose 64 which can exactly fit into a page,
-/// which is usually enough for most cases.
-const ADMIN_QUEUE_SIZE: usize = 64;
+/// We'll use the maximum supported by the controller
+/// to avoid queue full issues with many I/O queues.
+const MIN_ADMIN_QUEUE_SIZE: usize = 2;
 
 /// Default size of I/O queues.
 const IO_QUEUE_SIZE: usize = 256;
-
-/// Default number of I/O queue pairs.
-const DEFAULT_IO_QUEUES: usize = 4;
-
-/// Maximum number of I/O queue pairs.
-const MAX_IO_QUEUES: usize = 64;
 
 /// Temperature threshold type.
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +195,10 @@ pub struct ControllerData {
     pub min_pagesize: usize,
     /// Maximum queue entries
     pub max_queue_entries: u16,
+    /// Maximum number of I/O submission queues (0-based)
+    pub max_io_sq: u16,
+    /// Maximum number of I/O completion queues (0-based)
+    pub max_io_cq: u16,
 }
 
 /// I/O queue pair representing submission and completion queues.
@@ -222,12 +220,12 @@ struct IoQueuePair {
 /// Internal device state - uses spin::Mutex for thread-safe interior mutability
 struct DeviceInner<A: Allocator> {
     allocator: Arc<A>,
-    doorbell_helper: Mutex<DoorbellHelper>,
+    doorbell_helper: DoorbellHelper,
     data: Mutex<ControllerData>,
-    io_queues: Mutex<Vec<Arc<Mutex<IoQueuePair>>>>,
+    ioq: Mutex<Vec<Arc<Mutex<IoQueuePair>>>>,
     queue_selector: AtomicUsize,
     next_queue_id: AtomicUsize,
-    shutting_down: Mutex<bool>,
+    shutting_down: AtomicBool,
 }
 
 /// A structure representing an NVMe namespace.
@@ -272,7 +270,7 @@ impl<A: Allocator> Namespace<A> {
 
     /// Select the optimal I/O queue for this operation.
     fn select_queue(&self) -> Option<Arc<Mutex<IoQueuePair>>> {
-        let queues = self.device.io_queues.lock();
+        let queues = self.device.ioq.lock();
         if queues.is_empty() {
             return None;
         }
@@ -315,12 +313,12 @@ impl<A: Allocator> Namespace<A> {
     /// Informs the controller that specified LBA ranges contain no valid data.
     pub fn trim(&self, lba: u64, block_count: u64) -> Result<()> {
         // Check if device is shutting down
-        if *self.device.shutting_down.lock() {
+        if self.device.shutting_down.load(Ordering::Acquire) {
             return Err(Error::DeviceShuttingDown);
         }
 
         let queue_arc = self.select_queue().ok_or(Error::NoActiveQueues)?;
-        let queue = queue_arc.lock();
+        let mut queue = queue_arc.lock();
         queue.outstanding.fetch_add(1, Ordering::Relaxed);
 
         // Prepare dataset management ranges (up to 256 ranges)
@@ -337,13 +335,8 @@ impl<A: Allocator> Namespace<A> {
             false,
         );
 
-        // Submit and wait
-        let tail = queue.sq.push(cmd);
-        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
-
-        let (head, entry) = queue.cq.pop();
-        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
-        queue.sq.set_head(entry.sq_head as usize);
+        // Submit command with dynamic queue management
+        let entry = self.submit_iocmd(&mut queue, cmd)?;
         queue.outstanding.fetch_sub(1, Ordering::Relaxed);
 
         let status = (entry.status >> 1) & 0xff;
@@ -358,7 +351,7 @@ impl<A: Allocator> Namespace<A> {
     /// Much faster than writing actual zero buffers.
     pub fn write_zeroes(&self, lba: u64, block_count: u16) -> Result<()> {
         // Check if device is shutting down
-        if *self.device.shutting_down.lock() {
+        if self.device.shutting_down.load(Ordering::Acquire) {
             return Err(Error::DeviceShuttingDown);
         }
 
@@ -375,10 +368,10 @@ impl<A: Allocator> Namespace<A> {
         );
 
         let tail = queue.sq.push(cmd);
-        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+        self.device.doorbell_helper.write(Doorbell::SubTail(queue.qid), tail as u32);
 
         let (head, entry) = queue.cq.pop();
-        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        self.device.doorbell_helper.write(Doorbell::CompHead(queue.qid), head as u32);
         queue.sq.set_head(entry.sq_head as usize);
         queue.outstanding.fetch_sub(1, Ordering::Relaxed);
 
@@ -398,7 +391,7 @@ impl<A: Allocator> Namespace<A> {
         }
 
         // Check if device is shutting down
-        if *self.device.shutting_down.lock() {
+        if self.device.shutting_down.load(Ordering::Acquire) {
             return Err(Error::DeviceShuttingDown);
         }
 
@@ -424,10 +417,10 @@ impl<A: Allocator> Namespace<A> {
         );
 
         let tail = queue.sq.push(cmd);
-        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+        self.device.doorbell_helper.write(Doorbell::SubTail(queue.qid), tail as u32);
 
         let (head, entry) = queue.cq.pop();
-        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        self.device.doorbell_helper.write(Doorbell::CompHead(queue.qid), head as u32);
         queue.sq.set_head(entry.sq_head as usize);
 
         // Release PRP resources
@@ -448,7 +441,7 @@ impl<A: Allocator> Namespace<A> {
     /// Critical for data scrubbing and integrity verification.
     pub fn verify(&self, lba: u64, block_count: u16) -> Result<()> {
         // Check if device is shutting down
-        if *self.device.shutting_down.lock() {
+        if self.device.shutting_down.load(Ordering::Acquire) {
             return Err(Error::DeviceShuttingDown);
         }
 
@@ -464,10 +457,10 @@ impl<A: Allocator> Namespace<A> {
         );
 
         let tail = queue.sq.push(cmd);
-        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+        self.device.doorbell_helper.write(Doorbell::SubTail(queue.qid), tail as u32);
 
         let (head, entry) = queue.cq.pop();
-        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        self.device.doorbell_helper.write(Doorbell::CompHead(queue.qid), head as u32);
         queue.sq.set_head(entry.sq_head as usize);
         queue.outstanding.fetch_sub(1, Ordering::Relaxed);
 
@@ -483,7 +476,7 @@ impl<A: Allocator> Namespace<A> {
     /// Essential for efficient data migration and backup.
     pub fn copy(&self, src_lba: u64, dst_lba: u64, block_count: u16) -> Result<()> {
         // Check if device is shutting down
-        if *self.device.shutting_down.lock() {
+        if self.device.shutting_down.load(Ordering::Acquire) {
             return Err(Error::DeviceShuttingDown);
         }
 
@@ -508,10 +501,10 @@ impl<A: Allocator> Namespace<A> {
         );
 
         let tail = queue.sq.push(cmd);
-        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+        self.device.doorbell_helper.write(Doorbell::SubTail(queue.qid), tail as u32);
 
         let (head, entry) = queue.cq.pop();
-        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+        self.device.doorbell_helper.write(Doorbell::CompHead(queue.qid), head as u32);
         queue.sq.set_head(entry.sq_head as usize);
         queue.outstanding.fetch_sub(1, Ordering::Relaxed);
 
@@ -523,10 +516,26 @@ impl<A: Allocator> Namespace<A> {
         Ok(())
     }
 
+    /// Submit I/O command to hardware queue
+    fn submit_iocmd(&self, queue: &mut IoQueuePair, cmd: Command) -> Result<Completion> {
+        // Push command to submission queue (will spin if full)
+        let tail = queue.sq.push(cmd);
+        self.device.doorbell_helper.write(Doorbell::SubTail(queue.qid), tail as u32);
+
+        // Wait for completion
+        let (head, entry) = queue.cq.pop();
+        self.device.doorbell_helper.write(Doorbell::CompHead(queue.qid), head as u32);
+
+        // Update submission queue head from completion entry
+        queue.sq.set_head(entry.sq_head as usize);
+
+        Ok(entry)
+    }
+
     /// Perform I/O operation.
     fn do_io(&self, lba: u64, address: usize, bytes: usize, write: bool) -> Result<()> {
         // Check if device is shutting down
-        if *self.device.shutting_down.lock() {
+        if self.device.shutting_down.load(Ordering::Acquire) {
             return Err(Error::DeviceShuttingDown);
         }
 
@@ -555,14 +564,8 @@ impl<A: Allocator> Namespace<A> {
             write,
         );
 
-        // Submit command
-        let tail = queue.sq.push(command);
-        self.device.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
-
-        // Wait for completion
-        let (head, entry) = queue.cq.pop();
-        self.device.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
-        queue.sq.set_head(entry.sq_head as usize);
+        // Submit command with dynamic queue management
+        let entry = self.submit_iocmd(&mut queue, command)?;
 
         // Release PRP resources
         queue.prp_manager.release(prp_result, self.device.allocator.as_ref());
@@ -590,6 +593,8 @@ pub struct NVMeDevice<A: Allocator> {
     admin_sq: SubQueue,
     admin_cq: CompQueue,
     admin_buffer: Dma<u8>,
+    // Mutex to serialize admin commands
+    admin_lock: Mutex<()>,
 }
 
 unsafe impl<A: Allocator> Send for NVMeDevice<A> {}
@@ -602,38 +607,43 @@ impl<A: Allocator> NVMeDevice<A> {
     /// 1. Mark queues for shutdown (no new I/O accepted)
     /// 2. Wait for outstanding I/O to complete
     /// 3. Remove the queues from hardware
-    pub fn set_io_queue_count(&self, target: usize) -> Result<()> {
+    pub fn set_ioq_count(&self, target: usize) -> Result<()> {
         if target == 0 {
             return Err(Error::InvalidQueueCount);
         }
 
-        if target > MAX_IO_QUEUES {
+        let hw_limit = {
+            let data = self.inner.data.lock();
+            data.max_io_sq.min(data.max_io_cq) as usize
+        };
+
+        if target > hw_limit {
             return Err(Error::TooManyQueues);
         }
 
-        let current = self.inner.io_queues.lock().len();
+        let current = self.ioq_count();
 
         if target > current {
             // Add queues
             for _ in current..target {
-                self.add_io_queue_internal()?;
+                self.add_ioq_internal()?;
             }
         } else if target < current {
             // Remove queues safely
-            self.remove_io_queues_internal(current - target)?;
+            self.rm_ioq_internal(current - target)?;
         }
 
         Ok(())
     }
 
     /// Get the current number of I/O queue pairs.
-    pub fn io_queue_count(&self) -> usize {
-        self.inner.io_queues.lock().len()
+    pub fn ioq_count(&self) -> usize {
+        self.inner.ioq.lock().len()
     }
 
     /// Get the current number of active (non-shutdown) I/O queue pairs.
-    pub fn active_io_queue_count(&self) -> usize {
-        self.inner.io_queues.lock()
+    pub fn active_ioq_count(&self) -> usize {
+        self.inner.ioq.lock()
             .iter()
             .filter(|q| !q.lock().shutdown.load(Ordering::Acquire))
             .count()
@@ -641,7 +651,7 @@ impl<A: Allocator> NVMeDevice<A> {
 
     /// Get statistics for each queue.
     pub fn queue_stats(&self) -> Vec<(u16, usize, bool)> {
-        self.inner.io_queues.lock()
+        self.inner.ioq.lock()
             .iter()
             .map(|q| {
                 let queue = q.lock();
@@ -655,15 +665,13 @@ impl<A: Allocator> NVMeDevice<A> {
     }
 
     /// Internal method to add a new I/O queue pair.
-    fn add_io_queue_internal(&self) -> Result<u16> {
+    fn add_ioq_internal(&self) -> Result<u16> {
         let max_queue_entries = self.inner.data.lock().max_queue_entries;
-        let queue_size = IO_QUEUE_SIZE.min(max_queue_entries as usize);
+        // Use a reasonable I/O queue size, but ensure at least 2 entries
+        let queue_size = IO_QUEUE_SIZE.min(max_queue_entries as usize).max(2);
 
         let qid = self.inner.next_queue_id.fetch_add(1, Ordering::SeqCst) as u16;
-        if qid > MAX_IO_QUEUES as u16 {
-            self.inner.next_queue_id.fetch_sub(1, Ordering::SeqCst);
-            return Err(Error::TooManyQueues);
-        }
+        // No artificial limit - only hardware limits apply!
 
         // Create queue structures
         let sq = SubQueue::new(queue_size, self.inner.allocator.as_ref());
@@ -698,14 +706,14 @@ impl<A: Allocator> NVMeDevice<A> {
             shutdown: AtomicBool::new(false),
         }));
 
-        self.inner.io_queues.lock().push(queue_pair);
+        self.inner.ioq.lock().push(queue_pair);
         Ok(qid)
     }
 
     /// Internal method to remove specified number of I/O queues safely.
-    fn remove_io_queues_internal(&self, count: usize) -> Result<()> {
+    fn rm_ioq_internal(&self, count: usize) -> Result<()> {
         let queues_to_remove = {
-            let queues = self.inner.io_queues.lock();
+            let queues = self.inner.ioq.lock();
 
             // Don't remove if it would leave us with no queues
             if queues.len() <= count {
@@ -749,11 +757,11 @@ impl<A: Allocator> NVMeDevice<A> {
 
                     // Push flush command (blocking is OK here - controlled removal)
                     let tail = queue.sq.push(flush_cmd);
-                    self.inner.doorbell_helper.lock().write(Doorbell::SubTail(*qid), tail as u32);
+                    self.inner.doorbell_helper.write(Doorbell::SubTail(*qid), tail as u32);
 
                     // MUST wait for flush completion for data safety
                     let (head, _entry) = queue.cq.pop();
-                    self.inner.doorbell_helper.lock().write(Doorbell::CompHead(*qid), head as u32);
+                    self.inner.doorbell_helper.write(Doorbell::CompHead(*qid), head as u32);
                     queue.sq.set_head(_entry.sq_head as usize);
                 }
             }
@@ -795,10 +803,10 @@ impl<A: Allocator> NVMeDevice<A> {
         }
 
         // Phase 4: Remove from the queue list
-        let mut queues = self.inner.io_queues.lock();
+        let mut queues = self.inner.ioq.lock();
         queues.retain(|q| {
             let qid = q.lock().qid;
-            !queues_to_remove.iter().any(|(_, remove_qid)| *remove_qid == qid)
+            !queues_to_remove.iter().any(|(_, rm_qid)| *rm_qid == qid)
         });
 
         Ok(())
@@ -813,37 +821,43 @@ impl<A: Allocator> NVMeDevice<A> {
     /// the `Allocator` trait used for the entire NVMe device.
     pub fn init(address: usize, allocator: A) -> Result<Self> {
         let allocator = Arc::new(allocator);
-        let doorbell_helper = DoorbellHelper::new(address, 0);
+        // Need to read capabilities first to get the doorbell stride and max queue entries
+        let cap = unsafe { ((address + Register::CAP as usize) as *const u64).read_volatile() };
+        let doorbell_stride = (cap >> 32) as u8 & 0xF;
+        let max_queue_entries = (cap & 0x7FFF) as usize + 1;
+        let min_pagesize = 1 << (((cap >> 48) as u8 & 0xF) + 12);
+
+        // Use hardware maximum for admin queue - software queue handles overflow efficiently
+        // No artificial limits - let hardware capabilities determine the size
+        let admin_queue_size = max_queue_entries.max(MIN_ADMIN_QUEUE_SIZE);
+
+        let doorbell_helper = DoorbellHelper::new(address, doorbell_stride);
 
         let inner = Arc::new(DeviceInner {
             allocator: allocator.clone(),
-            doorbell_helper: Mutex::new(doorbell_helper),
+            doorbell_helper: doorbell_helper,
             data: Mutex::new(Default::default()),
-            io_queues: Mutex::new(Vec::new()),
+            ioq: Mutex::new(Vec::new()),
             queue_selector: AtomicUsize::new(0),
             next_queue_id: AtomicUsize::new(1),
-            shutting_down: Mutex::new(false),
+            shutting_down: AtomicBool::new(false),
         });
 
         let device = Self {
             address: address as _,
             inner: inner.clone(),
             namespaces: RwLock::new(BTreeMap::new()),
-            admin_sq: SubQueue::new(ADMIN_QUEUE_SIZE, allocator.as_ref()),
-            admin_cq: CompQueue::new(ADMIN_QUEUE_SIZE, allocator.as_ref()),
+            admin_sq: SubQueue::new(admin_queue_size, allocator.as_ref()),
+            admin_cq: CompQueue::new(admin_queue_size, allocator.as_ref()),
             admin_buffer: Dma::allocate(4096, allocator.as_ref()),
+            admin_lock: Mutex::new(()),
         };
 
-        // Read controller capabilities
-        let cap = device.get_reg::<u64>(Register::CAP);
-        let doorbell_stride = (cap >> 32) as u8 & 0xF;
-
-        // Update inner fields safely using Mutex
-        *device.inner.doorbell_helper.lock() = DoorbellHelper::new(address, doorbell_stride);
+        // Update controller data with capability values
         {
             let mut data = device.inner.data.lock();
-            data.min_pagesize = 1 << (((cap >> 48) as u8 & 0xF) + 12);
-            data.max_queue_entries = (cap & 0x7FFF) as u16 + 1;
+            data.min_pagesize = min_pagesize;
+            data.max_queue_entries = max_queue_entries as u16;
         }
 
         // Reset controller
@@ -855,7 +869,7 @@ impl<A: Allocator> NVMeDevice<A> {
         // Configure admin queues
         device.set_reg::<u64>(Register::ASQ, device.admin_sq.address() as u64);
         device.set_reg::<u64>(Register::ACQ, device.admin_cq.address() as u64);
-        let aqa = (ADMIN_QUEUE_SIZE as u32 - 1) << 16 | (ADMIN_QUEUE_SIZE as u32 - 1);
+        let aqa = (admin_queue_size as u32 - 1) << 16 | (admin_queue_size as u32 - 1);
         device.set_reg::<u32>(Register::AQA, aqa);
 
         // Enable controller
@@ -892,13 +906,41 @@ impl<A: Allocator> NVMeDevice<A> {
 
             let max_pages = 1 << device.admin_buffer.as_ref()[77];
             data.max_transfer_size = max_pages as usize * data.min_pagesize;
+
+            // Note: SQES (bytes 512) and CQES (byte 513) are queue entry sizes, not queue counts
+            // We'll get the actual maximum I/O queue counts via Set Features
+        }
+
+        // Negotiate maximum number of I/O queues with the controller
+        // Request a reasonable number of queues (e.g., 64 of each type)
+        // The controller will respond with the actual number it can support
+        let requested_queues = 63;  // 0-based value (63 means 64 queues)
+        let queue_config = (requested_queues << 16) | requested_queues;
+
+        let result = device.exec_admin(Command::set_features(
+            device.admin_sq.tail() as u16,
+            FeatureId::NumberOfQueues,
+            queue_config,
+            false,
+        ))?;
+
+        // Extract actual allocated queue counts from completion entry
+        // Bits 31:16 = Number of I/O Completion Queues Allocated (0-based)
+        // Bits 15:0 = Number of I/O Submission Queues Allocated (0-based)
+        let allocated_sq = (result.command_specific & 0xFFFF) + 1;
+        let allocated_cq = ((result.command_specific >> 16) & 0xFFFF) + 1;
+
+        {
+            let mut data = device.inner.data.lock();
+            data.max_io_sq = allocated_sq as u16;
+            data.max_io_cq = allocated_cq as u16;
         }
 
         // Create I/O queues
-        device.create_io_queues()?;
+        device.create_ioq()?;
 
         // Identify all namespaces
-        device.identify_all_namespaces()?;
+        device.ident_namespaces_all()?;
 
         Ok(device)
     }
@@ -911,25 +953,25 @@ impl<A: Allocator> NVMeDevice<A> {
     }
 
     /// Get controller data.
-    pub fn controller_data(&self) -> ControllerData {
+    pub fn data(&self) -> ControllerData {
         self.inner.data.lock().clone()
     }
 
     /// Create initial I/O queues.
-    fn create_io_queues(&self) -> Result<()> {
+    fn create_ioq(&self) -> Result<()> {
         // Start with one I/O queue pair
-        self.add_io_queue_internal()?;
+        self.add_ioq_internal()?;
         Ok(())
     }
 
     /// Destroy all I/O queues.
     /// Ensures all data is flushed before deletion.
-    fn destroy_io_queues(&self) -> Result<()> {
-        let queue_count = self.inner.io_queues.lock().len();
+    fn destroy_ioq(&self) -> Result<()> {
+        let queue_count = self.inner.ioq.lock().len();
         if queue_count > 0 {
             // Phase 1: Mark all queues for shutdown
             {
-                let queues = self.inner.io_queues.lock();
+                let queues = self.inner.ioq.lock();
                 for queue in queues.iter() {
                     queue.lock().shutdown.store(true, Ordering::Release);
                 }
@@ -938,25 +980,25 @@ impl<A: Allocator> NVMeDevice<A> {
             // Phase 2: Flush all namespaces and wait for completion
             // This is critical - we MUST ensure flushes complete for data safety
             for &ns_id in self.namespaces.read().keys() {
-                let queues = self.inner.io_queues.lock().clone();
+                let queues = self.inner.ioq.lock().clone();
                 for queue_arc in queues.iter() {
                     let queue = queue_arc.lock();
                     let flush_cmd = Command::flush(queue.sq.tail() as u16, ns_id);
 
                     // Push flush command
                     let tail = queue.sq.push(flush_cmd);
-                    self.inner.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+                    self.inner.doorbell_helper.write(Doorbell::SubTail(queue.qid), tail as u32);
 
                     // Wait for flush completion - this is essential
                     let (head, _entry) = queue.cq.pop();
-                    self.inner.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+                    self.inner.doorbell_helper.write(Doorbell::CompHead(queue.qid), head as u32);
                     queue.sq.set_head(_entry.sq_head as usize);
                 }
             }
 
             // Phase 3: Delete all queues from hardware
             // Controller reset will handle any remaining I/O
-            let queues = self.inner.io_queues.lock().clone();
+            let queues = self.inner.ioq.lock().clone();
             for queue_arc in queues.iter().rev() {
                 let qid = queue_arc.lock().qid;
 
@@ -974,13 +1016,13 @@ impl<A: Allocator> NVMeDevice<A> {
             }
         }
 
-        self.inner.io_queues.lock().clear();
+        self.inner.ioq.lock().clear();
         self.inner.next_queue_id.store(1, Ordering::SeqCst);
         Ok(())
     }
 
     /// Identify all namespaces on the device.
-    fn identify_all_namespaces(&self) -> Result<()> {
+    fn ident_namespaces_all(&self) -> Result<()> {
         // Get namespace list
         self.exec_admin(Command::identify(
             self.admin_sq.tail() as u16,
@@ -1038,11 +1080,19 @@ impl<A: Allocator> NVMeDevice<A> {
 
     /// Execute an admin command.
     fn exec_admin(&self, cmd: Command) -> Result<Completion> {
-        let tail = self.admin_sq.push(cmd);
-        self.inner.doorbell_helper.lock().write(Doorbell::SubTail(0), tail as u32);
+        // Serialize admin commands to prevent race conditions
+        let _guard = self.admin_lock.lock();
 
+        // Push command to submission queue (will spin if full)
+        let tail = self.admin_sq.push(cmd);
+        self.inner.doorbell_helper.write(Doorbell::SubTail(0), tail as u32);
+
+        // Wait for completion
         let (head, entry) = self.admin_cq.pop();
-        self.inner.doorbell_helper.lock().write(Doorbell::CompHead(0), head as u32);
+        self.inner.doorbell_helper.write(Doorbell::CompHead(0), head as u32);
+
+        // Update submission queue head from completion entry
+        self.admin_sq.set_head(entry.sq_head as usize);
 
         let status = (entry.status >> 1) & 0xff;
         if status != 0 {
@@ -1067,11 +1117,11 @@ impl<A: Allocator> NVMeDevice<A> {
 impl<A: Allocator> Drop for NVMeDevice<A> {
     fn drop(&mut self) {
         // 1. Set global shutdown flag
-        *self.inner.shutting_down.lock() = true;
+        self.inner.shutting_down.store(true, Ordering::Release);
 
         // 2. Flush each namespace on each queue
         for &ns_id in self.namespaces.read().keys() {
-            let queues = self.inner.io_queues.lock().clone();
+            let queues = self.inner.ioq.lock().clone();
             for queue_arc in queues.iter() {
                 let queue = queue_arc.lock();
 
@@ -1080,17 +1130,17 @@ impl<A: Allocator> Drop for NVMeDevice<A> {
 
                 let flush_cmd = Command::flush(queue.sq.tail() as u16, ns_id);
                 let tail = queue.sq.push(flush_cmd);
-                self.inner.doorbell_helper.lock().write(Doorbell::SubTail(queue.qid), tail as u32);
+                self.inner.doorbell_helper.write(Doorbell::SubTail(queue.qid), tail as u32);
 
                 // Wait for flush completion
                 let (head, entry) = queue.cq.pop();
-                self.inner.doorbell_helper.lock().write(Doorbell::CompHead(queue.qid), head as u32);
+                self.inner.doorbell_helper.write(Doorbell::CompHead(queue.qid), head as u32);
                 queue.sq.set_head(entry.sq_head as usize);
             }
         }
 
         // 3. Destroy queues
-        let _ = self.destroy_io_queues();
+        let _ = self.destroy_ioq();
 
         // 4. Reset controller
         self.set_reg::<u32>(Register::CC,

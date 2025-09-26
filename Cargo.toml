@@ -1,6 +1,6 @@
 [package]
 name = "nvme-rs"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 repository = "https://github.com/H4n-uL/NVMe-Rust"
 description = "Bare-metal NVMe driver which will never be yanked"
