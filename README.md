@@ -32,7 +32,7 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     let controller = NVMeDevice::init(virtual_address, Allocator)?;
 
     // Some useful data you may want to see
-    let _controller_data = controller.controller_data();
+    let _controller_data = controller.data();
 
     // Select the first namespace
     let namespace = controller.get_ns(1)?;
@@ -40,7 +40,7 @@ pub fn nvme_test() -> Result<(), Box<dyn core::error::Error>> {
     // You can get the block size and count of the namespace
     let _disk_size = namespace.total_size();
 
-    // Should not be larger than controller_data.max_transfer_size
+    // Should not be larger than data.max_transfer_size
     const TEST_LENGTH: usize = 524288;
 
     // Create a 4096 byte aligned read buffer

@@ -1062,7 +1062,7 @@ impl<A: Allocator> NVMeDevice<A> {
     }
 
     /// Get the list of all namespaces on the device.
-    pub fn list_namespaces(&self) -> Vec<u32> {
+    pub fn list_ns(&self) -> Vec<u32> {
         self.namespaces.read().keys().cloned().collect()
     }
 
